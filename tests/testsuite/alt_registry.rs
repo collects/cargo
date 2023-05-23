@@ -28,14 +28,14 @@ fn depend_on_alt_registry() {
 
     Package::new("bar", "0.0.1").alternative(true).publish();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
 [UPDATING] `alternative` index
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] bar v0.0.1 (registry `alternative`)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -44,11 +44,11 @@ fn depend_on_alt_registry() {
     p.cargo("clean").run();
 
     // Don't download a second time
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] bar v0.0.1 (registry `alternative`)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -81,16 +81,16 @@ fn depend_on_alt_registry_depends_on_same_registry_no_index() {
         .alternative(true)
         .publish();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
 [UPDATING] `alternative` index
 [DOWNLOADING] crates ...
 [DOWNLOADED] [..] v0.0.1 (registry `alternative`)
 [DOWNLOADED] [..] v0.0.1 (registry `alternative`)
-[COMPILING] baz v0.0.1 (registry `alternative`)
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] baz v0.0.1 (registry `alternative`)
+[CHECKING] bar v0.0.1 (registry `alternative`)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -123,16 +123,16 @@ fn depend_on_alt_registry_depends_on_same_registry() {
         .alternative(true)
         .publish();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
 [UPDATING] `alternative` index
 [DOWNLOADING] crates ...
 [DOWNLOADED] [..] v0.0.1 (registry `alternative`)
 [DOWNLOADED] [..] v0.0.1 (registry `alternative`)
-[COMPILING] baz v0.0.1 (registry `alternative`)
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] baz v0.0.1 (registry `alternative`)
+[CHECKING] bar v0.0.1 (registry `alternative`)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -165,7 +165,7 @@ fn depend_on_alt_registry_depends_on_crates_io() {
         .alternative(true)
         .publish();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr_unordered(
             "\
 [UPDATING] `alternative` index
@@ -173,9 +173,9 @@ fn depend_on_alt_registry_depends_on_crates_io() {
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.0.1 (registry `dummy-registry`)
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
-[COMPILING] baz v0.0.1
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] baz v0.0.1
+[CHECKING] bar v0.0.1 (registry `alternative`)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -205,11 +205,11 @@ fn registry_and_path_dep_works() {
         .file("bar/src/lib.rs", "")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
-[COMPILING] bar v0.0.1 ([CWD]/bar)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] bar v0.0.1 ([CWD]/bar)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -237,7 +237,7 @@ fn registry_incompatible_with_git() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_status(101)
         .with_stderr_contains(
             "  dependency (bar) specification is ambiguous. \
@@ -287,7 +287,12 @@ fn cannot_publish_to_crates_io_with_registry_dependency() {
 
 #[cargo_test]
 fn publish_with_registry_dependency() {
-    registry::alt_init();
+    let _reg = RegistryBuilder::new()
+        .http_api()
+        .http_index()
+        .alternative()
+        .build();
+
     let p = project()
         .file(
             "Cargo.toml",
@@ -307,10 +312,29 @@ fn publish_with_registry_dependency() {
 
     Package::new("bar", "0.0.1").alternative(true).publish();
 
-    // Login so that we have the token available
-    p.cargo("login --registry alternative TOKEN").run();
-
-    p.cargo("publish --registry alternative").run();
+    p.cargo("publish --registry alternative")
+        .with_stderr(
+            "\
+[UPDATING] `alternative` index
+[WARNING] [..]
+[..]
+[PACKAGING] foo v0.0.1 [..]
+[UPDATING] `alternative` index
+[VERIFYING] foo v0.0.1 [..]
+[DOWNLOADING] [..]
+[DOWNLOADED] bar v0.0.1 (registry `alternative`)
+[COMPILING] bar v0.0.1 (registry `alternative`)
+[COMPILING] foo v0.0.1 [..]
+[FINISHED] [..]
+[PACKAGED] [..]
+[UPLOADING] foo v0.0.1 [..]
+[UPLOADED] foo v0.0.1 to registry `alternative`
+note: Waiting for `foo v0.0.1` to be available at registry `alternative`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+[PUBLISHED] foo v0.0.1 at registry `alternative`
+",
+        )
+        .run();
 
     validate_alt_upload(
         r#"{
@@ -342,6 +366,7 @@ fn publish_with_registry_dependency() {
             "repository": null,
             "homepage": null,
             "documentation": null,
+            "rust_version": null,
             "vers": "0.0.1"
         }"#,
         "foo-0.0.1.crate",
@@ -377,7 +402,7 @@ fn alt_registry_and_crates_io_deps() {
         .alternative(true)
         .publish();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr_unordered(
             "\
 [UPDATING] `alternative` index
@@ -385,9 +410,9 @@ fn alt_registry_and_crates_io_deps() {
 [DOWNLOADING] crates ...
 [DOWNLOADED] crates_io_dep v0.0.1 (registry `dummy-registry`)
 [DOWNLOADED] alt_reg_dep v0.1.0 (registry `alternative`)
-[COMPILING] alt_reg_dep v0.1.0 (registry `alternative`)
-[COMPILING] crates_io_dep v0.0.1
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] alt_reg_dep v0.1.0 (registry `alternative`)
+[CHECKING] crates_io_dep v0.0.1
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -399,31 +424,77 @@ fn block_publish_due_to_no_token() {
     registry::alt_init();
     let p = project().file("src/lib.rs", "").build();
 
-    fs::remove_file(paths::home().join(".cargo/credentials")).unwrap();
+    fs::remove_file(paths::home().join(".cargo/credentials.toml")).unwrap();
 
     // Now perform the actual publish
     p.cargo("publish --registry alternative")
         .with_status(101)
-        .with_stderr_contains(
-            "error: no upload token found, \
-            please run `cargo login` or pass `--token`",
+        .with_stderr(
+            "\
+[UPDATING] `alternative` index
+error: no token found for `alternative`, please run `cargo login --registry alternative`
+or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cargo_registries_crates_io_protocol() {
+    let _ = RegistryBuilder::new()
+        .no_configure_token()
+        .alternative()
+        .build();
+    // Should not produce a warning due to the registries.crates-io.protocol = 'sparse' configuration
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            ".cargo/config.toml",
+            "[registries.crates-io]
+            protocol = 'sparse'",
+        )
+        .build();
+
+    p.cargo("publish --registry alternative")
+        .with_status(101)
+        .with_stderr(
+            "\
+[UPDATING] `alternative` index
+error: no token found for `alternative`, please run `cargo login --registry alternative`
+or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN",
         )
         .run();
 }
 
 #[cargo_test]
 fn publish_to_alt_registry() {
-    registry::alt_init();
+    let _reg = RegistryBuilder::new()
+        .http_api()
+        .http_index()
+        .alternative()
+        .build();
+
     let p = project().file("src/main.rs", "fn main() {}").build();
 
-    // Setup the registry by publishing a package
-    Package::new("bar", "0.0.1").alternative(true).publish();
-
-    // Login so that we have the token available
-    p.cargo("login --registry alternative TOKEN").run();
-
     // Now perform the actual publish
-    p.cargo("publish --registry alternative").run();
+    p.cargo("publish --registry alternative")
+        .with_stderr(
+            "\
+[UPDATING] `alternative` index
+[WARNING] [..]
+[..]
+[PACKAGING] foo v0.0.1 [..]
+[VERIFYING] foo v0.0.1 [..]
+[COMPILING] foo v0.0.1 [..]
+[FINISHED] [..]
+[PACKAGED] [..]
+[UPLOADING] foo v0.0.1 [..]
+[UPLOADED] foo v0.0.1 to registry `alternative`
+note: Waiting for `foo v0.0.1` to be available at registry `alternative`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+[PUBLISHED] foo v0.0.1 at registry `alternative`
+",
+        )
+        .run();
 
     validate_alt_upload(
         r#"{
@@ -445,6 +516,7 @@ fn publish_to_alt_registry() {
             "repository": null,
             "homepage": null,
             "documentation": null,
+            "rust_version": null,
             "vers": "0.0.1"
         }"#,
         "foo-0.0.1.crate",
@@ -454,7 +526,14 @@ fn publish_to_alt_registry() {
 
 #[cargo_test]
 fn publish_with_crates_io_dep() {
-    registry::alt_init();
+    // crates.io registry.
+    let _dummy_reg = registry::init();
+    // Alternative registry.
+    let _alt_reg = RegistryBuilder::new()
+        .http_api()
+        .http_index()
+        .alternative()
+        .build();
     let p = project()
         .file(
             "Cargo.toml",
@@ -475,10 +554,29 @@ fn publish_with_crates_io_dep() {
 
     Package::new("bar", "0.0.1").publish();
 
-    // Login so that we have the token available
-    p.cargo("login --registry alternative TOKEN").run();
-
-    p.cargo("publish --registry alternative").run();
+    p.cargo("publish --registry alternative")
+        .with_stderr(
+            "\
+[UPDATING] `alternative` index
+[WARNING] [..]
+[..]
+[PACKAGING] foo v0.0.1 [..]
+[UPDATING] `dummy-registry` index
+[VERIFYING] foo v0.0.1 [..]
+[DOWNLOADING] [..]
+[DOWNLOADED] bar v0.0.1 (registry `dummy-registry`)
+[COMPILING] bar v0.0.1
+[COMPILING] foo v0.0.1 [..]
+[FINISHED] [..]
+[PACKAGED] [..]
+[UPLOADING] foo v0.0.1 [..]
+[UPLOADED] foo v0.0.1 to registry `alternative`
+note: Waiting for `foo v0.0.1` to be available at registry `alternative`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+[PUBLISHED] foo v0.0.1 at registry `alternative`
+",
+        )
+        .run();
 
     validate_alt_upload(
         r#"{
@@ -511,6 +609,7 @@ fn publish_with_crates_io_dep() {
             "repository": null,
             "homepage": null,
             "documentation": null,
+            "rust_version": null,
             "vers": "0.0.1"
         }"#,
         "foo-0.0.1.crate",
@@ -578,12 +677,12 @@ fn patch_alt_reg() {
         .file("bar/src/lib.rs", "pub fn bar() {}")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
 [UPDATING] `alternative` index
-[COMPILING] bar v0.1.0 ([CWD]/bar)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] bar v0.1.0 ([CWD]/bar)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
 ",
         )
@@ -660,14 +759,14 @@ fn no_api() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
 [UPDATING] `alternative` index
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `alternative`)
-[COMPILING] bar v0.0.1 (registry `alternative`)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] bar v0.0.1 (registry `alternative`)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -801,6 +900,9 @@ fn alt_reg_metadata() {
                     }
                 ],
                 "workspace_members": [
+                    "foo 0.0.1 (path+file:[..]/foo)"
+                ],
+                "workspace_default_members": [
                     "foo 0.0.1 (path+file:[..]/foo)"
                 ],
                 "resolve": null,
@@ -1003,6 +1105,9 @@ fn alt_reg_metadata() {
                 "workspace_members": [
                     "foo 0.0.1 (path+file:[..]/foo)"
                 ],
+                "workspace_default_members": [
+                    "foo 0.0.1 (path+file:[..]/foo)"
+                ],
                 "resolve": "{...}",
                 "target_directory": "[..]/foo/target",
                 "version": 1,
@@ -1048,7 +1153,7 @@ fn unknown_registry() {
     config.insert(start + start_index, '#');
     fs::write(&cfg_path, config).unwrap();
 
-    p.cargo("build").run();
+    p.cargo("check").run();
 
     // Important parts:
     // foo -> bar registry = null
@@ -1166,6 +1271,9 @@ fn unknown_registry() {
               "workspace_members": [
                 "foo 0.0.1 (path+file://[..]/foo)"
               ],
+              "workspace_default_members": [
+                "foo 0.0.1 (path+file://[..]/foo)"
+              ],
               "resolve": "{...}",
               "target_directory": "[..]/foo/target",
               "version": 1,
@@ -1210,14 +1318,14 @@ fn registries_index_relative_url() {
 
     Package::new("bar", "0.0.1").alternative(true).publish();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(
             "\
 [UPDATING] `relative` index
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.0.1 (registry `relative`)
-[COMPILING] bar v0.0.1 (registry `relative`)
-[COMPILING] foo v0.0.1 ([CWD])
+[CHECKING] bar v0.0.1 (registry `relative`)
+[CHECKING] foo v0.0.1 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]s
 ",
         )
@@ -1257,7 +1365,7 @@ fn registries_index_relative_path_not_allowed() {
 
     Package::new("bar", "0.0.1").alternative(true).publish();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr(&format!(
             "\
 error: failed to parse manifest at `{root}/foo/Cargo.toml`
@@ -1291,6 +1399,25 @@ fn both_index_and_registry() {
 }
 
 #[cargo_test]
+fn both_index_and_default() {
+    let p = project().file("src/lib.rs", "").build();
+    for cmd in &[
+        "publish",
+        "owner",
+        "search",
+        "yank --version 1.0.0",
+        "install foo",
+    ] {
+        p.cargo(cmd)
+            .env("CARGO_REGISTRY_DEFAULT", "undefined")
+            .arg(format!("--index=index_url"))
+            .with_status(101)
+            .with_stderr("[ERROR] invalid url `index_url`: relative URL without a base")
+            .run();
+    }
+}
+
+#[cargo_test]
 fn sparse_lockfile() {
     let _registry = registry::RegistryBuilder::new()
         .http_index()
@@ -1314,9 +1441,7 @@ fn sparse_lockfile() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("-Zsparse-registry generate-lockfile")
-        .masquerade_as_nightly_cargo(&["sparse-registry"])
-        .run();
+    p.cargo("generate-lockfile").run();
     assert_match_exact(
         &p.read_lockfile(),
         r#"# This file is automatically @generated by Cargo.
@@ -1362,9 +1487,7 @@ fn publish_with_transitive_dep() {
         )
         .file("src/lib.rs", "")
         .build();
-    p1.cargo("publish -Zsparse-registry --registry Alt-1")
-        .masquerade_as_nightly_cargo(&["sparse-registry"])
-        .run();
+    p1.cargo("publish --registry Alt-1").run();
 
     let p2 = project()
         .file(
@@ -1381,7 +1504,5 @@ fn publish_with_transitive_dep() {
         )
         .file("src/lib.rs", "")
         .build();
-    p2.cargo("publish -Zsparse-registry")
-        .masquerade_as_nightly_cargo(&["sparse-registry"])
-        .run();
+    p2.cargo("publish").run();
 }

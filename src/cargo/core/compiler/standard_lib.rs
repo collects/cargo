@@ -11,7 +11,6 @@ use crate::ops::{self, Packages};
 use crate::util::errors::CargoResult;
 use crate::Config;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::path::PathBuf;
 
 use super::BuildConfig;
@@ -93,7 +92,7 @@ pub fn resolve_std<'cfg>(
         String::from("library/std"),
         String::from("library/core"),
         String::from("library/alloc"),
-        String::from("library/test"),
+        String::from("library/sysroot"),
     ];
     let ws_config = crate::core::WorkspaceConfig::Root(crate::core::WorkspaceRootConfig::new(
         &src_path,
@@ -115,13 +114,13 @@ pub fn resolve_std<'cfg>(
     let config = ws.config();
     // This is a delicate hack. In order for features to resolve correctly,
     // the resolver needs to run a specific "current" member of the workspace.
-    // Thus, in order to set the features for `std`, we need to set `libtest`
-    // to be the "current" member. `libtest` is the root, and all other
+    // Thus, in order to set the features for `std`, we need to set `sysroot`
+    // to be the "current" member. `sysroot` is the root, and all other
     // standard library crates are dependencies from there. Since none of the
     // other crates need to alter their features, this should be fine, for
     // now. Perhaps in the future features will be decoupled from the resolver
     // and it will be easier to control feature selection.
-    let current_manifest = src_path.join("library/test/Cargo.toml");
+    let current_manifest = src_path.join("library/sysroot/Cargo.toml");
     // TODO: Consider doing something to enforce --locked? Or to prevent the
     // lock file from being written, such as setting ephemeral.
     let mut std_ws = Workspace::new_virtual(src_path, current_manifest, virtual_manifest, config)?;
@@ -129,10 +128,10 @@ pub fn resolve_std<'cfg>(
     // `[dev-dependencies]`. No need for us to generate a `Resolve` which has
     // those included because we'll never use them anyway.
     std_ws.set_require_optional_deps(false);
-    // `test` is not in the default set because it is optional, but it needs
-    // to be part of the resolve in case we do need it.
+    // `sysroot` is not in the default set because it is optional, but it needs
+    // to be part of the resolve in case we do need it or `libtest`.
     let mut spec_pkgs = Vec::from(crates);
-    spec_pkgs.push("test".to_string());
+    spec_pkgs.push("sysroot".to_string());
     let spec = Packages::Packages(spec_pkgs);
     let specs = spec.to_package_id_specs(&std_ws)?;
     let features = match &config.cli_unstable().build_std_features {
@@ -214,6 +213,7 @@ pub fn generate_std_roots(
                 /*is_std*/ true,
                 /*dep_hash*/ 0,
                 IsArtifact::No,
+                None,
             ));
         }
     }
@@ -221,7 +221,7 @@ pub fn generate_std_roots(
 }
 
 fn detect_sysroot_src_path(target_data: &RustcTargetData<'_>) -> CargoResult<PathBuf> {
-    if let Some(s) = env::var_os("__CARGO_TESTS_ONLY_SRC_ROOT") {
+    if let Some(s) = target_data.config.get_env_os("__CARGO_TESTS_ONLY_SRC_ROOT") {
         return Ok(s.into());
     }
 
@@ -240,7 +240,7 @@ fn detect_sysroot_src_path(target_data: &RustcTargetData<'_>) -> CargoResult<Pat
              library, try:\n        rustup component add rust-src",
             lock
         );
-        match env::var("RUSTUP_TOOLCHAIN") {
+        match target_data.config.get_env("RUSTUP_TOOLCHAIN") {
             Ok(rustup_toolchain) => {
                 anyhow::bail!("{} --toolchain {}", msg, rustup_toolchain);
             }

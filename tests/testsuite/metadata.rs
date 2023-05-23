@@ -65,6 +65,7 @@ fn cargo_metadata_simple() {
             }
         ],
         "workspace_members": ["foo 0.5.0 (path+file:[..]foo)"],
+        "workspace_default_members": ["foo 0.5.0 (path+file:[..]foo)"],
         "resolve": {
             "nodes": [
                 {
@@ -164,6 +165,7 @@ crate-type = ["lib", "staticlib"]
             }
         ],
         "workspace_members": ["foo 0.5.0 (path+file:[..]foo)"],
+        "workspace_default_members": ["foo 0.5.0 (path+file:[..]foo)"],
         "resolve": {
             "nodes": [
                 {
@@ -257,6 +259,7 @@ optional_feat = []
             }
         ],
         "workspace_members": ["foo 0.5.0 (path+file:[..]foo)"],
+        "workspace_default_members": ["foo 0.5.0 (path+file:[..]foo)"],
         "resolve": {
             "nodes": [
                 {
@@ -587,6 +590,9 @@ fn cargo_metadata_with_deps_and_version() {
         "workspace_members": [
             "foo 0.5.0 (path+file:[..]foo)"
         ],
+        "workspace_default_members": [
+            "foo 0.5.0 (path+file:[..]foo)"
+        ],
         "workspace_root": "[..]/foo",
         "metadata": null
     }"#,
@@ -666,6 +672,9 @@ name = "ex"
             }
         ],
         "workspace_members": [
+            "foo 0.1.0 (path+file:[..]foo)"
+        ],
+        "workspace_default_members": [
             "foo 0.1.0 (path+file:[..]foo)"
         ],
         "resolve": {
@@ -761,6 +770,9 @@ crate-type = ["rlib", "dylib"]
             }
         ],
         "workspace_members": [
+            "foo 0.1.0 (path+file:[..]foo)"
+        ],
+         "workspace_default_members": [
             "foo 0.1.0 (path+file:[..]foo)"
         ],
         "resolve": {
@@ -892,6 +904,7 @@ fn workspace_metadata() {
             }
         ],
         "workspace_members": ["bar 0.5.0 (path+file:[..]bar)", "baz 0.5.0 (path+file:[..]baz)"],
+        "workspace_default_members": ["bar 0.5.0 (path+file:[..]bar)", "baz 0.5.0 (path+file:[..]baz)"],
         "resolve": {
             "nodes": [
                 {
@@ -1123,6 +1136,11 @@ fn workspace_metadata_with_dependencies_no_deps() {
             "artifact 0.5.0 (path+file:[..]/foo/artifact)",
             "baz 0.5.0 (path+file:[..]baz)"
         ],
+        "workspace_default_members": [
+            "bar 0.5.0 (path+file:[..]bar)",
+            "artifact 0.5.0 (path+file:[..]/foo/artifact)",
+            "baz 0.5.0 (path+file:[..]baz)"
+        ],
         "resolve": null,
         "target_directory": "[..]foo/target",
         "version": 1,
@@ -1152,17 +1170,17 @@ fn workspace_metadata_with_dependencies_and_resolve() {
                 name = "bar"
                 version = "0.5.0"
                 authors = []
-                
+
                 [build-dependencies]
                 artifact = { path = "../artifact/", artifact = "bin", target = "target" }
                 bin-only-artifact = { path = "../bin-only-artifact/", artifact = "bin", target = "$ALT_TARGET" }
                 non-artifact = { path = "../non-artifact" }
-                
+
                 [dependencies]
                 artifact = { path = "../artifact/", artifact = ["cdylib", "staticlib", "bin:baz-name"], lib = true, target = "$ALT_TARGET" }
                 bin-only-artifact = { path = "../bin-only-artifact/", artifact = "bin:a-name" }
                 non-artifact = { path = "../non-artifact" }
-                
+
                 [dev-dependencies]
                 artifact = { path = "../artifact/" }
                 non-artifact = { path = "../non-artifact" }
@@ -1617,12 +1635,36 @@ fn workspace_metadata_with_dependencies_and_resolve() {
                   {
                     "dependencies": [
                       "artifact 0.5.0 (path+file://[..]/foo/artifact)",
+                      "bin-only-artifact 0.5.0 (path+file://[..]/foo/bin-only-artifact)",
                       "non-artifact 0.5.0 (path+file://[..]/foo/non-artifact)"
                     ],
                     "deps": [
                       {
                         "dep_kinds": [
                           {
+                            "extern_name": "artifact",
+                            "kind": null,
+                            "target": null
+                          },
+                          {
+                            "artifact": "cdylib",
+                            "compile_target": "wasm32-unknown-unknown",
+                            "extern_name": "artifact",
+                            "kind": null,
+                            "target": null
+                          },
+                          {
+                            "artifact": "staticlib",
+                            "compile_target": "wasm32-unknown-unknown",
+                            "extern_name": "artifact",
+                            "kind": null,
+                            "target": null
+                          },
+                          {
+                            "artifact": "bin",
+                            "bin_name": "baz-name",
+                            "compile_target": "wasm32-unknown-unknown",
+                            "extern_name": "baz_name",
                             "kind": null,
                             "target": null
                           },
@@ -1631,12 +1673,60 @@ fn workspace_metadata_with_dependencies_and_resolve() {
                             "target": null
                           },
                           {
+                            "artifact": "bin",
+                            "bin_name": "bar-name",
+                            "compile_target": "<target>",
+                            "extern_name": "bar_name",
+                            "kind": "build",
+                            "target": null
+                          },
+                          {
+                            "artifact": "bin",
+                            "bin_name": "baz-name",
+                            "compile_target": "<target>",
+                            "extern_name": "baz_name",
                             "kind": "build",
                             "target": null
                           }
                         ],
                         "name": "artifact",
                         "pkg": "artifact 0.5.0 (path+file://[..]/foo/artifact)"
+                      },
+                      {
+                        "dep_kinds": [
+                          {
+                            "artifact": "bin",
+                            "bin_name": "a-name",
+                            "extern_name": "a_name",
+                            "kind": null,
+                            "target": null
+                          },
+                          {
+                            "artifact": "bin",
+                            "bin_name": "b-name",
+                            "extern_name": "b_name",
+                            "kind": "dev",
+                            "target": null
+                          },
+                          {
+                            "artifact": "bin",
+                            "bin_name": "a-name",
+                            "compile_target": "wasm32-unknown-unknown",
+                            "extern_name": "a_name",
+                            "kind": "build",
+                            "target": null
+                          },
+                          {
+                            "artifact": "bin",
+                            "bin_name": "b-name",
+                            "compile_target": "wasm32-unknown-unknown",
+                            "extern_name": "b_name",
+                            "kind": "build",
+                            "target": null
+                          }
+                        ],
+                        "name": "",
+                        "pkg": "bin-only-artifact 0.5.0 (path+file://[..]/foo/bin-only-artifact)"
                       },
                       {
                         "dep_kinds": [
@@ -1678,6 +1768,12 @@ fn workspace_metadata_with_dependencies_and_resolve() {
               "target_directory": "[..]/foo/target",
               "version": 1,
               "workspace_members": [
+                "bar 0.5.0 (path+file://[..]/foo/bar)",
+                "artifact 0.5.0 (path+file://[..]/foo/artifact)",
+                "bin-only-artifact 0.5.0 (path+file://[..]/foo/bin-only-artifact)",
+                "non-artifact 0.5.0 (path+file://[..]/foo/non-artifact)"
+              ],
+              "workspace_default_members": [
                 "bar 0.5.0 (path+file://[..]/foo/bar)",
                 "artifact 0.5.0 (path+file://[..]/foo/artifact)",
                 "bin-only-artifact 0.5.0 (path+file://[..]/foo/bin-only-artifact)",
@@ -1725,7 +1821,8 @@ fn cargo_metadata_with_invalid_authors_field() {
             r#"[ERROR] failed to parse manifest at `[..]`
 
 Caused by:
-  invalid type: string "", expected a sequence for key `package.authors`"#,
+  invalid type: string "", expected a vector of strings or workspace
+  in `package.authors`"#,
         )
         .run();
 }
@@ -1749,7 +1846,8 @@ fn cargo_metadata_with_invalid_version_field() {
             r#"[ERROR] failed to parse manifest at `[..]`
 
 Caused by:
-  invalid type: integer `1`, expected SemVer version for key `package.version`"#,
+  invalid type: integer `1`, expected SemVer version
+  in `package.version`"#,
         )
         .run();
 }
@@ -1773,7 +1871,68 @@ fn cargo_metadata_with_invalid_publish_field() {
             r#"[ERROR] failed to parse manifest at `[..]`
 
 Caused by:
-  invalid type: string "foo", expected a boolean or vector of strings for key `package.publish`"#,
+  invalid type: string "foo", expected a boolean, a vector of strings, or workspace
+  in `package.publish`"#,
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cargo_metadata_with_invalid_artifact_deps() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.5.0"
+
+                [dependencies]
+                artifact = { path = "artifact", artifact = "bin:notfound" }
+           "#,
+        )
+        .file("src/lib.rs", "")
+        .file("artifact/Cargo.toml", &basic_bin_manifest("artifact"))
+        .file("artifact/src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("metadata -Z bindeps")
+        .masquerade_as_nightly_cargo(&["bindeps"])
+        .with_status(101)
+        .with_stderr(
+            "\
+[WARNING] please specify `--format-version` flag explicitly to avoid compatibility problems
+[ERROR] dependency `artifact` in package `foo` requires a `bin:notfound` artifact to be present.",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn cargo_metadata_with_invalid_duplicate_renamed_deps() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.5.0"
+
+                [dependencies]
+                bar = { path = "bar" }
+                baz = { path = "bar", package = "bar" }
+           "#,
+        )
+        .file("src/lib.rs", "")
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    p.cargo("metadata")
+        .with_status(101)
+        .with_stderr(
+            "\
+[WARNING] please specify `--format-version` flag explicitly to avoid compatibility problems
+[ERROR] the crate `foo v0.5.0 ([..])` depends on crate `bar v0.5.0 ([..])` multiple times with different names",
         )
         .run();
 }
@@ -1818,6 +1977,7 @@ const MANIFEST_OUTPUT: &str = r#"
         "documentation": null
     }],
     "workspace_members": [ "foo 0.5.0 (path+file:[..]foo)" ],
+    "workspace_default_members": [ "foo 0.5.0 (path+file:[..]foo)" ],
     "resolve": null,
     "target_directory": "[..]foo/target",
     "version": 1,
@@ -1910,7 +2070,7 @@ fn cargo_metadata_bad_version() {
         .with_status(1)
         .with_stderr_contains(
             "\
-error: '2' isn't a valid value for '--format-version <VERSION>'
+error: invalid value '2' for '--format-version <VERSION>'
   [possible values: 1]
 ",
         )
@@ -2012,6 +2172,7 @@ fn package_metadata() {
             }
         ],
         "workspace_members": ["foo[..]"],
+        "workspace_default_members": ["foo[..]"],
         "resolve": null,
         "target_directory": "[..]foo/target",
         "version": 1,
@@ -2087,6 +2248,7 @@ fn package_publish() {
             }
         ],
         "workspace_members": ["foo[..]"],
+        "workspace_default_members": ["foo[..]"],
         "resolve": null,
         "target_directory": "[..]foo/target",
         "version": 1,
@@ -2182,6 +2344,9 @@ fn cargo_metadata_path_to_cargo_toml_project() {
                 "workspace_members": [
                     "bar 0.5.0 (path+file:[..])"
                 ],
+                "workspace_default_members": [
+                    "bar 0.5.0 (path+file:[..])"
+                ],
                 "workspace_root": "[..]",
                 "metadata": null
             }
@@ -2268,6 +2433,9 @@ fn package_edition_2018() {
                 "target_directory": "[..]",
                 "version": 1,
                 "workspace_members": [
+                    "foo 0.1.0 (path+file:[..])"
+                ],
+                "workspace_default_members": [
                     "foo 0.1.0 (path+file:[..])"
                 ],
                 "workspace_root": "[..]",
@@ -2416,6 +2584,9 @@ fn target_edition_2018() {
                 "target_directory": "[..]",
                 "version": 1,
                 "workspace_members": [
+                    "foo 0.1.0 (path+file:[..])"
+                ],
+                "workspace_default_members": [
                     "foo 0.1.0 (path+file:[..])"
                 ],
                 "workspace_root": "[..]",
@@ -2654,6 +2825,9 @@ fn rename_dependency() {
     "workspace_members": [
         "foo 0.0.1[..]"
     ],
+    "workspace_default_members": [
+        "foo 0.0.1[..]"
+    ],
     "workspace_root": "[..]",
     "metadata": null
 }"#,
@@ -2754,6 +2928,9 @@ fn metadata_links() {
               "workspace_members": [
                 "foo 0.5.0 [..]"
               ],
+              "workspace_default_members": [
+                "foo 0.5.0 [..]"
+              ],
               "workspace_root": "[..]/foo",
               "metadata": null
             }
@@ -2842,6 +3019,9 @@ fn deps_with_bin_only() {
                 }
               ],
               "workspace_members": [
+                "foo 0.1.0 ([..])"
+              ],
+              "workspace_default_members": [
                 "foo 0.1.0 ([..])"
               ],
               "resolve": {
@@ -3223,6 +3403,9 @@ fn filter_platform() {
   "workspace_members": [
     "foo 0.1.0 (path+file:[..]foo)"
   ],
+  "workspace_default_members": [
+    "foo 0.1.0 (path+file:[..]foo)"
+  ],
   "resolve": {
     "nodes": [
       {
@@ -3342,6 +3525,7 @@ fn filter_platform() {
     $NORMAL_DEP
   ],
   "workspace_members": "{...}",
+  "workspace_default_members": "{...}",
   "resolve": {
     "nodes": [
       {
@@ -3423,6 +3607,7 @@ fn filter_platform() {
     $NORMAL_DEP
   ],
   "workspace_members": "{...}",
+  "workspace_default_members": "{...}",
   "resolve": {
     "nodes": [
       {
@@ -3507,6 +3692,7 @@ fn filter_platform() {
     $NORMAL_DEP
   ],
   "workspace_members": "{...}",
+  "workspace_default_members": "{...}",
   "resolve": {
     "nodes": [
       {
@@ -3621,6 +3807,7 @@ fn dep_kinds() {
             {
               "packages": "{...}",
               "workspace_members": "{...}",
+              "workspace_default_members": "{...}",
               "target_directory": "{...}",
               "version": 1,
               "workspace_root": "{...}",
@@ -3736,6 +3923,7 @@ fn dep_kinds_workspace() {
             {
               "packages": "{...}",
               "workspace_members": "{...}",
+              "workspace_default_members": "{...}",
               "target_directory": "[..]/foo/target",
               "version": 1,
               "workspace_root": "[..]/foo",
@@ -4045,6 +4233,11 @@ fn workspace_metadata_with_dependencies_no_deps_artifact() {
               "target_directory": "[..]/foo/target",
               "version": 1,
               "workspace_members": [
+                "bar 0.5.0 (path+file://[..]/foo/bar)",
+                "artifact 0.5.0 (path+file://[..]/foo/artifact)",
+                "baz 0.5.0 (path+file://[..]/foo/baz)"
+              ],
+              "workspace_default_members": [
                 "bar 0.5.0 (path+file://[..]/foo/bar)",
                 "artifact 0.5.0 (path+file://[..]/foo/artifact)",
                 "baz 0.5.0 (path+file://[..]/foo/baz)"

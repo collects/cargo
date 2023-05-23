@@ -160,6 +160,70 @@ fn cargo_compile_manifest_path() {
 }
 
 #[cargo_test]
+fn chdir_gated() {
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .build();
+    p.cargo("-C foo build")
+        .cwd(p.root().parent().unwrap())
+        .with_stderr(
+            "error: the `-C` flag is unstable, \
+            pass `-Z unstable-options` on the nightly channel to enable it",
+        )
+        .with_status(101)
+        .run();
+    // No masquerade should also fail.
+    p.cargo("-C foo -Z unstable-options build")
+        .cwd(p.root().parent().unwrap())
+        .with_stderr(
+            "error: the `-C` flag is unstable, \
+            pass `-Z unstable-options` on the nightly channel to enable it",
+        )
+        .with_status(101)
+        .run();
+}
+
+#[cargo_test]
+fn cargo_compile_directory_not_cwd() {
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/foo.rs", &main_file(r#""i am foo""#, &[]))
+        .file(".cargo/config.toml", &"")
+        .build();
+
+    p.cargo("-Zunstable-options -C foo build")
+        .masquerade_as_nightly_cargo(&["chdir"])
+        .cwd(p.root().parent().unwrap())
+        .run();
+    assert!(p.bin("foo").is_file());
+}
+
+#[cargo_test]
+fn cargo_compile_directory_not_cwd_with_invalid_config() {
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/foo.rs", &main_file(r#""i am foo""#, &[]))
+        .file(".cargo/config.toml", &"!")
+        .build();
+
+    p.cargo("-Zunstable-options -C foo build")
+        .masquerade_as_nightly_cargo(&["chdir"])
+        .cwd(p.root().parent().unwrap())
+        .with_status(101)
+        .with_stderr_contains(
+            "\
+Caused by:
+  TOML parse error at line 1, column 1
+    |
+  1 | !
+    | ^
+  invalid key
+",
+        )
+        .run();
+}
+
+#[cargo_test]
 fn cargo_compile_with_invalid_manifest() {
     let p = project().file("Cargo.toml", "").build();
 
@@ -202,8 +266,8 @@ Caused by:
     |
   3 |                 foo = bar
     |                       ^
-  Unexpected `b`
-  Expected quoted string
+  invalid string
+  expected `\"`, `'`
 ",
         )
         .run();
@@ -227,8 +291,8 @@ Caused by:
     |
   1 | a = bar
     |     ^
-  Unexpected `b`
-  Expected quoted string
+  invalid string
+  expected `\"`, `'`
 ",
         )
         .run();
@@ -259,7 +323,9 @@ fn cargo_compile_duplicate_build_targets() {
     p.cargo("build")
         .with_stderr(
             "\
-warning: file found to be present in multiple build targets: [..]main.rs
+warning: file `[..]main.rs` found to be present in multiple build targets:
+  * `lib` target `main`
+  * `bin` target `foo`
 [COMPILING] foo v0.0.1 ([..])
 [FINISHED] [..]
 ",
@@ -280,7 +346,8 @@ fn cargo_compile_with_invalid_version() {
 [ERROR] failed to parse manifest at `[..]`
 
 Caused by:
-  unexpected end of input while parsing minor version number for key `package.version`
+  unexpected end of input while parsing minor version number
+  in `package.version`
 ",
         )
         .run();
@@ -598,7 +665,9 @@ fn cargo_compile_with_invalid_code() {
 
     p.cargo("build")
         .with_status(101)
-        .with_stderr_contains("[ERROR] could not compile `foo` due to previous error\n")
+        .with_stderr_contains(
+            "[ERROR] could not compile `foo` (bin \"foo\") due to previous error\n",
+        )
         .run();
     assert!(p.root().join("Cargo.lock").is_file());
 }
@@ -1329,6 +1398,7 @@ fn crate_env_vars() {
             license = "MIT OR Apache-2.0"
             license-file = "license.txt"
             rust-version = "1.61.0"
+            readme = "../../README.md"
 
             [[bin]]
             name = "foo-bar"
@@ -1354,6 +1424,7 @@ fn crate_env_vars() {
                 static LICENSE_FILE: &'static str = env!("CARGO_PKG_LICENSE_FILE");
                 static DESCRIPTION: &'static str = env!("CARGO_PKG_DESCRIPTION");
                 static RUST_VERSION: &'static str = env!("CARGO_PKG_RUST_VERSION");
+                static README: &'static str = env!("CARGO_PKG_README");
                 static BIN_NAME: &'static str = env!("CARGO_BIN_NAME");
                 static CRATE_NAME: &'static str = env!("CARGO_CRATE_NAME");
 
@@ -1373,6 +1444,7 @@ fn crate_env_vars() {
                      assert_eq!("license.txt", LICENSE_FILE);
                      assert_eq!("This is foo", DESCRIPTION);
                      assert_eq!("1.61.0", RUST_VERSION);
+                     assert_eq!("../../README.md", README);
                     let s = format!("{}.{}.{}-{}", VERSION_MAJOR,
                                     VERSION_MINOR, VERSION_PATCH, VERSION_PRE);
                     assert_eq!(s, VERSION);
@@ -1426,6 +1498,23 @@ fn crate_env_vars() {
             "#,
         )
         .file(
+            "examples/ex-env-vars.rs",
+            r#"
+                static PKG_NAME: &'static str = env!("CARGO_PKG_NAME");
+                static BIN_NAME: &'static str = env!("CARGO_BIN_NAME");
+                static CRATE_NAME: &'static str = env!("CARGO_CRATE_NAME");
+
+                fn main() {
+                    assert_eq!("foo", PKG_NAME);
+                    assert_eq!("ex-env-vars", BIN_NAME);
+                    assert_eq!("ex_env_vars", CRATE_NAME);
+
+                    // Verify CARGO_TARGET_TMPDIR isn't set for examples
+                    assert!(option_env!("CARGO_TARGET_TMPDIR").is_none());
+                }
+            "#,
+        )
+        .file(
             "tests/env.rs",
             r#"
                 #[test]
@@ -1461,6 +1550,9 @@ fn crate_env_vars() {
     p.process(&p.bin("foo-bar"))
         .with_stdout("0-5-1 @ alpha.1 in [CWD]")
         .run();
+
+    println!("example");
+    p.cargo("run --example ex-env-vars -v").run();
 
     println!("test");
     p.cargo("test -v").run();
@@ -2891,7 +2983,7 @@ fn credentials_is_unreadable() {
         .file("src/lib.rs", "")
         .build();
 
-    let credentials = home().join(".cargo/credentials");
+    let credentials = home().join(".cargo/credentials.toml");
     t!(fs::create_dir_all(credentials.parent().unwrap()));
     t!(fs::write(
         &credentials,
@@ -2951,8 +3043,7 @@ Caused by:
     |
   1 | this is not valid toml
     |      ^
-  Unexpected `i`
-  Expected `.` or `=`
+  expected `.`, `=`
 ",
         )
         .run();
@@ -3794,7 +3885,7 @@ fn compiler_json_error_format() {
                 },
                 "profile": {
                     "debug_assertions": true,
-                    "debuginfo": 2,
+                    "debuginfo": 0,
                     "opt_level": "0",
                     "overflow_checks": true,
                     "test": false
@@ -5021,6 +5112,18 @@ fn inferred_benchmarks() {
 }
 
 #[cargo_test]
+fn no_infer_dirs() {
+    let p = project()
+        .file("src/lib.rs", "fn main() {}")
+        .file("examples/dir.rs/dummy", "")
+        .file("benches/dir.rs/dummy", "")
+        .file("tests/dir.rs/dummy", "")
+        .build();
+
+    p.cargo("build --examples --benches --tests").run(); // should not fail with "is a directory"
+}
+
+#[cargo_test]
 fn target_edition() {
     let p = project()
         .file(
@@ -5212,6 +5315,29 @@ fn uplift_pdb_of_bin_on_windows() {
     assert!(p.target_debug_dir().join("foo_bar.pdb").is_file());
     assert!(!p.target_debug_dir().join("c.pdb").exists());
     assert!(!p.target_debug_dir().join("d.pdb").exists());
+}
+
+#[cargo_test]
+#[cfg(target_os = "linux")]
+fn uplift_dwp_of_bin_on_linux() {
+    let p = project()
+        .file("src/main.rs", "fn main() { panic!(); }")
+        .file("src/bin/b.rs", "fn main() { panic!(); }")
+        .file("src/bin/foo-bar.rs", "fn main() { panic!(); }")
+        .file("examples/c.rs", "fn main() { panic!(); }")
+        .file("tests/d.rs", "fn main() { panic!(); }")
+        .build();
+
+    p.cargo("build --bins --examples --tests")
+        .enable_split_debuginfo_packed()
+        .run();
+    assert!(p.target_debug_dir().join("foo.dwp").is_file());
+    assert!(p.target_debug_dir().join("b.dwp").is_file());
+    assert!(p.target_debug_dir().join("examples/c.dwp").exists());
+    assert!(p.target_debug_dir().join("foo-bar").is_file());
+    assert!(p.target_debug_dir().join("foo-bar.dwp").is_file());
+    assert!(!p.target_debug_dir().join("c.dwp").exists());
+    assert!(!p.target_debug_dir().join("d.dwp").exists());
 }
 
 // Ensure that `cargo build` chooses the correct profile for building
@@ -5604,7 +5730,7 @@ fn signal_display() {
             "\
 [COMPILING] pm [..]
 [COMPILING] foo [..]
-[ERROR] could not compile `foo`
+[ERROR] could not compile `foo` [..]
 
 Caused by:
   process didn't exit successfully: `rustc [..]` (signal: 6, SIGABRT: process abort signal)
@@ -6128,23 +6254,28 @@ fn target_directory_backup_exclusion() {
     assert!(!&cachedir_tag.is_file());
 }
 
-#[cargo_test(>=1.64, reason = "--diagnostic-width is stabilized in 1.64")]
+#[cargo_test]
 fn simple_terminal_width() {
     let p = project()
         .file(
             "src/lib.rs",
             r#"
-                fn main() {
+                pub fn foo() {
                     let _: () = 42;
                 }
             "#,
         )
         .build();
 
-    p.cargo("build -Zterminal-width=20")
-        .masquerade_as_nightly_cargo(&["terminal-width"])
+    p.cargo("build -v")
+        .env("__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS", "20")
         .with_status(101)
-        .with_stderr_contains("3 | ..._: () = 42;")
+        .with_stderr_contains("[RUNNING] `rustc [..]--diagnostic-width=20[..]")
+        .run();
+
+    p.cargo("doc -v")
+        .env("__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS", "20")
+        .with_stderr_contains("[RUNNING] `rustdoc [..]--diagnostic-width=20[..]")
         .run();
 }
 

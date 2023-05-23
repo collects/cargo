@@ -9,6 +9,7 @@ use std::task::Poll;
 
 use crate::core::compiler::{BuildConfig, CompileMode, DefaultExecutor, Executor};
 use crate::core::resolver::CliFeatures;
+use crate::core::{registry::PackageRegistry, resolver::HasDevUnits};
 use crate::core::{Feature, Shell, Verbosity, Workspace};
 use crate::core::{Package, PackageId, PackageSet, Resolve, SourceId};
 use crate::sources::PathSource;
@@ -280,7 +281,7 @@ fn build_ar_list(
     if let Some(license_file) = &pkg.manifest().metadata().license_file {
         let license_path = Path::new(license_file);
         let abs_file_path = paths::normalize_path(&pkg.root().join(license_path));
-        if abs_file_path.exists() {
+        if abs_file_path.is_file() {
             check_for_file_and_add(
                 "license-file",
                 license_path,
@@ -290,26 +291,16 @@ fn build_ar_list(
                 ws,
             )?;
         } else {
-            let rel_msg = if license_path.is_absolute() {
-                "".to_string()
-            } else {
-                format!(" (relative to `{}`)", pkg.root().display())
-            };
-            ws.config().shell().warn(&format!(
-                "license-file `{}` does not appear to exist{}.\n\
-                Please update the license-file setting in the manifest at `{}`\n\
-                This may become a hard error in the future.",
-                license_path.display(),
-                rel_msg,
-                pkg.manifest_path().display()
-            ))?;
+            warn_on_nonexistent_file(&pkg, &license_path, "license-file", &ws)?;
         }
     }
     if let Some(readme) = &pkg.manifest().metadata().readme {
         let readme_path = Path::new(readme);
         let abs_file_path = paths::normalize_path(&pkg.root().join(readme_path));
-        if abs_file_path.exists() {
+        if abs_file_path.is_file() {
             check_for_file_and_add("readme", readme_path, abs_file_path, pkg, &mut result, ws)?;
+        } else {
+            warn_on_nonexistent_file(&pkg, &readme_path, "readme", &ws)?;
         }
     }
     result.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -341,10 +332,7 @@ fn check_for_file_and_add(
         Err(_) => {
             // The file exists somewhere outside of the package.
             let file_name = file_path.file_name().unwrap();
-            if result
-                .iter()
-                .any(|ar| ar.rel_path.file_name().unwrap() == file_name)
-            {
+            if result.iter().any(|ar| ar.rel_path == file_name) {
                 ws.config().shell().warn(&format!(
                     "{} `{}` appears to be a path outside of the package, \
                             but there is already a file named `{}` in the root of the package. \
@@ -368,6 +356,27 @@ fn check_for_file_and_add(
     Ok(())
 }
 
+fn warn_on_nonexistent_file(
+    pkg: &Package,
+    path: &Path,
+    manifest_key_name: &'static str,
+    ws: &Workspace<'_>,
+) -> CargoResult<()> {
+    let rel_msg = if path.is_absolute() {
+        "".to_string()
+    } else {
+        format!(" (relative to `{}`)", pkg.root().display())
+    };
+    ws.config().shell().warn(&format!(
+        "{manifest_key_name} `{}` does not appear to exist{}.\n\
+                Please update the {manifest_key_name} setting in the manifest at `{}`\n\
+                This may become a hard error in the future.",
+        path.display(),
+        rel_msg,
+        pkg.manifest_path().display()
+    ))
+}
+
 /// Construct `Cargo.lock` for the package to be published.
 fn build_lock(ws: &Workspace<'_>, orig_pkg: &Package) -> CargoResult<String> {
     let config = ws.config();
@@ -388,7 +397,18 @@ fn build_lock(ws: &Workspace<'_>, orig_pkg: &Package) -> CargoResult<String> {
 
     // Regenerate Cargo.lock using the old one as a guide.
     let tmp_ws = Workspace::ephemeral(new_pkg, ws.config(), None, true)?;
-    let (pkg_set, mut new_resolve) = ops::resolve_ws(&tmp_ws)?;
+    let mut tmp_reg = PackageRegistry::new(ws.config())?;
+    let mut new_resolve = ops::resolve_with_previous(
+        &mut tmp_reg,
+        &tmp_ws,
+        &CliFeatures::new_all(true),
+        HasDevUnits::Yes,
+        orig_resolve.as_ref(),
+        None,
+        &[],
+        true,
+    )?;
+    let pkg_set = ops::get_resolved_packages(&new_resolve, tmp_reg)?;
 
     if let Some(orig_resolve) = orig_resolve {
         compare_resolve(config, tmp_ws.current()?, &orig_resolve, &new_resolve)?;

@@ -6,20 +6,26 @@
 //! The [`compile`] function will do all the work to compile a workspace. A
 //! rough outline is:
 //!
-//! - Resolve the dependency graph (see [`ops::resolve`]).
-//! - Download any packages needed (see [`PackageSet`]).
-//! - Generate a list of top-level "units" of work for the targets the user
+//! 1. Resolve the dependency graph (see [`ops::resolve`]).
+//! 2. Download any packages needed (see [`PackageSet`](crate::core::PackageSet)).
+//! 3. Generate a list of top-level "units" of work for the targets the user
 //!   requested on the command-line. Each [`Unit`] corresponds to a compiler
-//!   invocation. This is done in this module ([`generate_targets`]).
-//! - Build the graph of `Unit` dependencies (see [`unit_dependencies`]).
-//! - Create a [`Context`] which will perform the following steps:
-//!     - Prepare the `target` directory (see [`Layout`]).
-//!     - Create a job queue (see `JobQueue`). The queue checks the
+//!   invocation. This is done in this module ([`UnitGenerator::generate_root_units`]).
+//! 4. Starting from the root [`Unit`]s, generate the [`UnitGraph`] by walking the dependency graph
+//!   from the resolver.  See also [`unit_dependencies`].
+//! 5. Construct the [`BuildContext`] with all of the information collected so
+//!   far. This is the end of the "front end" of compilation.
+//! 6. Create a [`Context`] which coordinates the compilation process
+//!   and will perform the following steps:
+//!     1. Prepare the `target` directory (see [`Layout`]).
+//!     2. Create a [`JobQueue`]. The queue checks the
 //!       fingerprint of each `Unit` to determine if it should run or be
 //!       skipped.
-//!     - Execute the queue. Each leaf in the queue's dependency graph is
-//!       executed, and then removed from the graph when finished. This
-//!       repeats until the queue is empty.
+//!     3. Execute the queue via [`drain_the_queue`]. Each leaf in the queue's dependency graph is
+//!        executed, and then removed from the graph when finished. This repeats until the queue is
+//!        empty.  Note that this is the only point in cargo that currently uses threads.
+//! 7. The result of the compilation is stored in the [`Compilation`] struct. This can be used for
+//!    various things, such as running tests after the compilation  has finished.
 //!
 //! **Note**: "target" inside this module generally refers to ["Cargo Target"],
 //! which corresponds to artifact that will be built in a package. Not to be
@@ -27,37 +33,39 @@
 //!
 //! [`unit_dependencies`]: crate::core::compiler::unit_dependencies
 //! [`Layout`]: crate::core::compiler::Layout
+//! [`JobQueue`]: crate::core::compiler::job_queue
+//! [`drain_the_queue`]: crate::core::compiler::job_queue
 //! ["Cargo Target"]: https://doc.rust-lang.org/nightly/cargo/reference/cargo-targets.html
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::core::compiler::unit_dependencies::{build_unit_dependencies, IsArtifact};
+use crate::core::compiler::unit_dependencies::build_unit_dependencies;
 use crate::core::compiler::unit_graph::{self, UnitDep, UnitGraph};
 use crate::core::compiler::{standard_lib, CrateType, TargetInfo};
 use crate::core::compiler::{BuildConfig, BuildContext, Compilation, Context};
 use crate::core::compiler::{CompileKind, CompileMode, CompileTarget, RustcTargetData, Unit};
 use crate::core::compiler::{DefaultExecutor, Executor, UnitInterner};
-use crate::core::profiles::{Profiles, UnitFor};
+use crate::core::profiles::Profiles;
 use crate::core::resolver::features::{self, CliFeatures, FeaturesFor};
 use crate::core::resolver::{HasDevUnits, Resolve};
-use crate::core::{FeatureValue, Package, PackageSet, Shell, Summary, Target};
-use crate::core::{PackageId, SourceId, TargetKind, Workspace};
+use crate::core::{PackageId, PackageSet, SourceId, TargetKind, Workspace};
 use crate::drop_println;
 use crate::ops;
 use crate::ops::resolve::WorkspaceResolve;
 use crate::util::config::Config;
 use crate::util::interning::InternedString;
-use crate::util::restricted_names::is_glob_pattern;
-use crate::util::{closest_msg, profile, CargoResult, StableHasher};
+use crate::util::{profile, CargoResult, StableHasher};
 
 mod compile_filter;
 pub use compile_filter::{CompileFilter, FilterRule, LibRule};
 
+mod unit_generator;
+use unit_generator::UnitGenerator;
+
 mod packages;
-use packages::build_glob;
+
 pub use packages::Packages;
 
 /// Contains information about how a package should be compiled.
@@ -68,7 +76,7 @@ pub use packages::Packages;
 /// of it as `CompileOptions` are high-level settings requested on the
 /// command-line, and `BuildConfig` are low-level settings for actually
 /// driving `rustc`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompileOptions {
     /// Configuration information for a rustc build
     pub build_config: BuildConfig,
@@ -215,14 +223,14 @@ pub fn create_bcx<'a, 'cfg>(
         | CompileMode::Check { .. }
         | CompileMode::Bench
         | CompileMode::RunCustomBuild => {
-            if std::env::var("RUST_FLAGS").is_ok() {
+            if ws.config().get_env("RUST_FLAGS").is_ok() {
                 config.shell().warn(
                     "Cargo does not read `RUST_FLAGS` environment variable. Did you mean `RUSTFLAGS`?",
                 )?;
             }
         }
         CompileMode::Doc { .. } | CompileMode::Doctest | CompileMode::Docscrape => {
-            if std::env::var("RUSTDOC_FLAGS").is_ok() {
+            if ws.config().get_env("RUSTDOC_FLAGS").is_ok() {
                 config.shell().warn(
                     "Cargo does not read `RUSTDOC_FLAGS` environment variable. Did you mean `RUSTDOCFLAGS`?"
                 )?;
@@ -233,27 +241,34 @@ pub fn create_bcx<'a, 'cfg>(
 
     let target_data = RustcTargetData::new(ws, &build_config.requested_kinds)?;
 
-    let all_packages = &Packages::All;
-    let rustdoc_scrape_examples = &config.cli_unstable().rustdoc_scrape_examples;
-    let need_reverse_dependencies = rustdoc_scrape_examples.is_some();
-    let full_specs = if need_reverse_dependencies {
-        all_packages
-    } else {
-        spec
-    };
+    let specs = spec.to_package_id_specs(ws)?;
+    let has_dev_units = {
+        // Rustdoc itself doesn't need dev-dependencies. But to scrape examples from packages in the
+        // workspace, if any of those packages need dev-dependencies, then we need include dev-dependencies
+        // to scrape those packages.
+        let any_pkg_has_scrape_enabled = ws
+            .members_with_features(&specs, cli_features)?
+            .iter()
+            .any(|(pkg, _)| {
+                pkg.targets()
+                    .iter()
+                    .any(|target| target.is_example() && target.doc_scrape_examples().is_enabled())
+            });
 
-    let resolve_specs = full_specs.to_package_id_specs(ws)?;
-    let has_dev_units = if filter.need_dev_deps(build_config.mode) || need_reverse_dependencies {
-        HasDevUnits::Yes
-    } else {
-        HasDevUnits::No
+        if filter.need_dev_deps(build_config.mode)
+            || (build_config.mode.is_doc() && any_pkg_has_scrape_enabled)
+        {
+            HasDevUnits::Yes
+        } else {
+            HasDevUnits::No
+        }
     };
     let resolve = ops::resolve_ws_with_opts(
         ws,
         &target_data,
         &build_config.requested_kinds,
         cli_features,
-        &resolve_specs,
+        &specs,
         has_dev_units,
         crate::core::resolver::features::ForceAllTargets::No,
     )?;
@@ -276,11 +291,6 @@ pub fn create_bcx<'a, 'cfg>(
     // Find the packages in the resolver that the user wants to build (those
     // passed in with `-p` or the defaults from the workspace), and convert
     // Vec<PackageIdSpec> to a Vec<PackageId>.
-    let specs = if need_reverse_dependencies {
-        spec.to_package_id_specs(ws)?
-    } else {
-        resolve_specs.clone()
-    };
     let to_build_ids = resolve.specs_to_ids(&specs)?;
     // Now get the `Package` for each `PackageId`. This may trigger a download
     // if the user specified `-p` for a dependency that is not downloaded.
@@ -341,70 +351,40 @@ pub fn create_bcx<'a, 'cfg>(
         .collect();
 
     // Passing `build_config.requested_kinds` instead of
-    // `explicit_host_kinds` here so that `generate_targets` can do
+    // `explicit_host_kinds` here so that `generate_root_units` can do
     // its own special handling of `CompileKind::Host`. It will
     // internally replace the host kind by the `explicit_host_kind`
     // before setting as a unit.
-    let mut units = generate_targets(
+    let generator = UnitGenerator {
         ws,
-        &to_builds,
+        packages: &to_builds,
         filter,
-        &build_config.requested_kinds,
+        requested_kinds: &build_config.requested_kinds,
         explicit_host_kind,
-        build_config.mode,
-        &resolve,
-        &workspace_resolve,
-        &resolved_features,
-        &pkg_set,
-        &profiles,
+        mode: build_config.mode,
+        resolve: &resolve,
+        workspace_resolve: &workspace_resolve,
+        resolved_features: &resolved_features,
+        package_set: &pkg_set,
+        profiles: &profiles,
         interner,
-    )?;
+        has_dev_units,
+    };
+    let mut units = generator.generate_root_units()?;
 
     if let Some(args) = target_rustc_crate_types {
         override_rustc_crate_types(&mut units, args, interner)?;
     }
 
-    let mut scrape_units = match rustdoc_scrape_examples {
-        Some(arg) => {
-            let filter = match arg.as_str() {
-                "all" => CompileFilter::new_all_targets(),
-                "examples" => CompileFilter::new(
-                    LibRule::False,
-                    FilterRule::none(),
-                    FilterRule::none(),
-                    FilterRule::All,
-                    FilterRule::none(),
-                ),
-                _ => {
-                    anyhow::bail!(
-                        r#"-Z rustdoc-scrape-examples must take "all" or "examples" as an argument"#
-                    )
-                }
-            };
-            let to_build_ids = resolve.specs_to_ids(&resolve_specs)?;
-            let to_builds = pkg_set.get_many(to_build_ids)?;
-            let mode = CompileMode::Docscrape;
-
-            generate_targets(
-                ws,
-                &to_builds,
-                &filter,
-                &build_config.requested_kinds,
-                explicit_host_kind,
-                mode,
-                &resolve,
-                &workspace_resolve,
-                &resolved_features,
-                &pkg_set,
-                &profiles,
-                interner,
-            )?
-            .into_iter()
-            // Proc macros should not be scraped for functions, since they only export macros
-            .filter(|unit| !unit.target.proc_macro())
-            .collect::<Vec<_>>()
+    let should_scrape = build_config.mode.is_doc() && config.cli_unstable().rustdoc_scrape_examples;
+    let mut scrape_units = if should_scrape {
+        UnitGenerator {
+            mode: CompileMode::Docscrape,
+            ..generator
         }
-        None => Vec::new(),
+        .generate_scrape_units(&units)?
+    } else {
+        Vec::new()
     };
 
     let std_roots = if let Some(crates) = standard_lib::std_crates(config, Some(&units)) {
@@ -443,25 +423,26 @@ pub fn create_bcx<'a, 'cfg>(
         remove_duplicate_doc(build_config, &units, &mut unit_graph);
     }
 
-    if build_config
+    let host_kind_requested = build_config
         .requested_kinds
         .iter()
-        .any(CompileKind::is_host)
-    {
+        .any(CompileKind::is_host);
+    let should_share_deps = host_kind_requested
+        || config.cli_unstable().bindeps
+            && unit_graph
+                .iter()
+                .any(|(unit, _)| unit.artifact_target_for_features.is_some());
+    if should_share_deps {
         // Rebuild the unit graph, replacing the explicit host targets with
-        // CompileKind::Host, merging any dependencies shared with build
-        // dependencies.
-        let new_graph = rebuild_unit_graph_shared(
+        // CompileKind::Host, removing `artifact_target_for_features` and merging any dependencies
+        // shared with build and artifact dependencies.
+        (units, scrape_units, unit_graph) = rebuild_unit_graph_shared(
             interner,
             unit_graph,
             &units,
             &scrape_units,
-            explicit_host_kind,
+            host_kind_requested.then_some(explicit_host_kind),
         );
-        // This would be nicer with destructuring assignment.
-        units = new_graph.0;
-        scrape_units = new_graph.1;
-        unit_graph = new_graph.2;
     }
 
     let mut extra_compiler_args = HashMap::new();
@@ -565,662 +546,34 @@ pub fn create_bcx<'a, 'cfg>(
     Ok(bcx)
 }
 
-/// A proposed target.
-///
-/// Proposed targets are later filtered into actual `Unit`s based on whether or
-/// not the target requires its features to be present.
-#[derive(Debug)]
-struct Proposal<'a> {
-    pkg: &'a Package,
-    target: &'a Target,
-    /// Indicates whether or not all required features *must* be present. If
-    /// false, and the features are not available, then it will be silently
-    /// skipped. Generally, targets specified by name (`--bin foo`) are
-    /// required, all others can be silently skipped if features are missing.
-    requires_features: bool,
-    mode: CompileMode,
-}
-
-/// Generates all the base targets for the packages the user has requested to
-/// compile. Dependencies for these targets are computed later in `unit_dependencies`.
-fn generate_targets(
-    ws: &Workspace<'_>,
-    packages: &[&Package],
-    filter: &CompileFilter,
-    requested_kinds: &[CompileKind],
-    explicit_host_kind: CompileKind,
-    mode: CompileMode,
-    resolve: &Resolve,
-    workspace_resolve: &Option<Resolve>,
-    resolved_features: &features::ResolvedFeatures,
-    package_set: &PackageSet<'_>,
-    profiles: &Profiles,
-    interner: &UnitInterner,
-) -> CargoResult<Vec<Unit>> {
-    let config = ws.config();
-    // Helper for creating a list of `Unit` structures
-    let new_unit = |units: &mut HashSet<Unit>,
-                    pkg: &Package,
-                    target: &Target,
-                    initial_target_mode: CompileMode| {
-        // Custom build units are added in `build_unit_dependencies`.
-        assert!(!target.is_custom_build());
-        let target_mode = match initial_target_mode {
-            CompileMode::Test => {
-                if target.is_example() && !filter.is_specific() && !target.tested() {
-                    // Examples are included as regular binaries to verify
-                    // that they compile.
-                    CompileMode::Build
-                } else {
-                    CompileMode::Test
-                }
-            }
-            CompileMode::Build => match *target.kind() {
-                TargetKind::Test => CompileMode::Test,
-                TargetKind::Bench => CompileMode::Bench,
-                _ => CompileMode::Build,
-            },
-            // `CompileMode::Bench` is only used to inform `filter_default_targets`
-            // which command is being used (`cargo bench`). Afterwards, tests
-            // and benches are treated identically. Switching the mode allows
-            // de-duplication of units that are essentially identical. For
-            // example, `cargo build --all-targets --release` creates the units
-            // (lib profile:bench, mode:test) and (lib profile:bench, mode:bench)
-            // and since these are the same, we want them to be de-duplicated in
-            // `unit_dependencies`.
-            CompileMode::Bench => CompileMode::Test,
-            _ => initial_target_mode,
-        };
-
-        let is_local = pkg.package_id().source_id().is_path();
-
-        // No need to worry about build-dependencies, roots are never build dependencies.
-        let features_for = FeaturesFor::from_for_host(target.proc_macro());
-        let features = resolved_features.activated_features(pkg.package_id(), features_for);
-
-        // If `--target` has not been specified, then the unit
-        // graph is built almost like if `--target $HOST` was
-        // specified. See `rebuild_unit_graph_shared` for more on
-        // why this is done. However, if the package has its own
-        // `package.target` key, then this gets used instead of
-        // `$HOST`
-        let explicit_kinds = if let Some(k) = pkg.manifest().forced_kind() {
-            vec![k]
-        } else {
-            requested_kinds
-                .iter()
-                .map(|kind| match kind {
-                    CompileKind::Host => {
-                        pkg.manifest().default_kind().unwrap_or(explicit_host_kind)
-                    }
-                    CompileKind::Target(t) => CompileKind::Target(*t),
-                })
-                .collect()
-        };
-
-        for kind in explicit_kinds.iter() {
-            let unit_for = if initial_target_mode.is_any_test() {
-                // NOTE: the `UnitFor` here is subtle. If you have a profile
-                // with `panic` set, the `panic` flag is cleared for
-                // tests/benchmarks and their dependencies. If this
-                // was `normal`, then the lib would get compiled three
-                // times (once with panic, once without, and once with
-                // `--test`).
-                //
-                // This would cause a problem for doc tests, which would fail
-                // because `rustdoc` would attempt to link with both libraries
-                // at the same time. Also, it's probably not important (or
-                // even desirable?) for rustdoc to link with a lib with
-                // `panic` set.
-                //
-                // As a consequence, Examples and Binaries get compiled
-                // without `panic` set. This probably isn't a bad deal.
-                //
-                // Forcing the lib to be compiled three times during `cargo
-                // test` is probably also not desirable.
-                UnitFor::new_test(config, *kind)
-            } else if target.for_host() {
-                // Proc macro / plugin should not have `panic` set.
-                UnitFor::new_compiler(*kind)
-            } else {
-                UnitFor::new_normal(*kind)
-            };
-            let profile = profiles.get_profile(
-                pkg.package_id(),
-                ws.is_member(pkg),
-                is_local,
-                unit_for,
-                *kind,
-            );
-            let unit = interner.intern(
-                pkg,
-                target,
-                profile,
-                kind.for_target(target),
-                target_mode,
-                features.clone(),
-                /*is_std*/ false,
-                /*dep_hash*/ 0,
-                IsArtifact::No,
-            );
-            units.insert(unit);
-        }
-    };
-
-    // Create a list of proposed targets.
-    let mut proposals: Vec<Proposal<'_>> = Vec::new();
-
-    match *filter {
-        CompileFilter::Default {
-            required_features_filterable,
-        } => {
-            for pkg in packages {
-                let default = filter_default_targets(pkg.targets(), mode);
-                proposals.extend(default.into_iter().map(|target| Proposal {
-                    pkg,
-                    target,
-                    requires_features: !required_features_filterable,
-                    mode,
-                }));
-                if mode == CompileMode::Test {
-                    if let Some(t) = pkg
-                        .targets()
-                        .iter()
-                        .find(|t| t.is_lib() && t.doctested() && t.doctestable())
-                    {
-                        proposals.push(Proposal {
-                            pkg,
-                            target: t,
-                            requires_features: false,
-                            mode: CompileMode::Doctest,
-                        });
-                    }
-                }
-            }
-        }
-        CompileFilter::Only {
-            all_targets,
-            ref lib,
-            ref bins,
-            ref examples,
-            ref tests,
-            ref benches,
-        } => {
-            if *lib != LibRule::False {
-                let mut libs = Vec::new();
-                for proposal in filter_targets(packages, Target::is_lib, false, mode) {
-                    let Proposal { target, pkg, .. } = proposal;
-                    if mode.is_doc_test() && !target.doctestable() {
-                        let types = target.rustc_crate_types();
-                        let types_str: Vec<&str> = types.iter().map(|t| t.as_str()).collect();
-                        ws.config().shell().warn(format!(
-                            "doc tests are not supported for crate type(s) `{}` in package `{}`",
-                            types_str.join(", "),
-                            pkg.name()
-                        ))?;
-                    } else {
-                        libs.push(proposal)
-                    }
-                }
-                if !all_targets && libs.is_empty() && *lib == LibRule::True {
-                    let names = packages.iter().map(|pkg| pkg.name()).collect::<Vec<_>>();
-                    if names.len() == 1 {
-                        anyhow::bail!("no library targets found in package `{}`", names[0]);
-                    } else {
-                        anyhow::bail!("no library targets found in packages: {}", names.join(", "));
-                    }
-                }
-                proposals.extend(libs);
-            }
-
-            // If `--tests` was specified, add all targets that would be
-            // generated by `cargo test`.
-            let test_filter = match tests {
-                FilterRule::All => Target::tested,
-                FilterRule::Just(_) => Target::is_test,
-            };
-            let test_mode = match mode {
-                CompileMode::Build => CompileMode::Test,
-                CompileMode::Check { .. } => CompileMode::Check { test: true },
-                _ => mode,
-            };
-            // If `--benches` was specified, add all targets that would be
-            // generated by `cargo bench`.
-            let bench_filter = match benches {
-                FilterRule::All => Target::benched,
-                FilterRule::Just(_) => Target::is_bench,
-            };
-            let bench_mode = match mode {
-                CompileMode::Build => CompileMode::Bench,
-                CompileMode::Check { .. } => CompileMode::Check { test: true },
-                _ => mode,
-            };
-
-            proposals.extend(list_rule_targets(
-                packages,
-                bins,
-                "bin",
-                Target::is_bin,
-                mode,
-            )?);
-            proposals.extend(list_rule_targets(
-                packages,
-                examples,
-                "example",
-                Target::is_example,
-                mode,
-            )?);
-            proposals.extend(list_rule_targets(
-                packages,
-                tests,
-                "test",
-                test_filter,
-                test_mode,
-            )?);
-            proposals.extend(list_rule_targets(
-                packages,
-                benches,
-                "bench",
-                bench_filter,
-                bench_mode,
-            )?);
-        }
-    }
-
-    // Only include targets that are libraries or have all required
-    // features available.
-    //
-    // `features_map` is a map of &Package -> enabled_features
-    // It is computed by the set of enabled features for the package plus
-    // every enabled feature of every enabled dependency.
-    let mut features_map = HashMap::new();
-    // This needs to be a set to de-duplicate units. Due to the way the
-    // targets are filtered, it is possible to have duplicate proposals for
-    // the same thing.
-    let mut units = HashSet::new();
-    for Proposal {
-        pkg,
-        target,
-        requires_features,
-        mode,
-    } in proposals
-    {
-        let unavailable_features = match target.required_features() {
-            Some(rf) => {
-                validate_required_features(
-                    workspace_resolve,
-                    target.name(),
-                    rf,
-                    pkg.summary(),
-                    &mut config.shell(),
-                )?;
-
-                let features = features_map.entry(pkg).or_insert_with(|| {
-                    resolve_all_features(resolve, resolved_features, package_set, pkg.package_id())
-                });
-                rf.iter().filter(|f| !features.contains(*f)).collect()
-            }
-            None => Vec::new(),
-        };
-        if target.is_lib() || unavailable_features.is_empty() {
-            new_unit(&mut units, pkg, target, mode);
-        } else if requires_features {
-            let required_features = target.required_features().unwrap();
-            let quoted_required_features: Vec<String> = required_features
-                .iter()
-                .map(|s| format!("`{}`", s))
-                .collect();
-            anyhow::bail!(
-                "target `{}` in package `{}` requires the features: {}\n\
-                 Consider enabling them by passing, e.g., `--features=\"{}\"`",
-                target.name(),
-                pkg.name(),
-                quoted_required_features.join(", "),
-                required_features.join(" ")
-            );
-        }
-        // else, silently skip target.
-    }
-    let mut units: Vec<_> = units.into_iter().collect();
-    unmatched_target_filters(&units, filter, &mut ws.config().shell())?;
-
-    // Keep the roots in a consistent order, which helps with checking test output.
-    units.sort_unstable();
-    Ok(units)
-}
-
-/// Checks if the unit list is empty and the user has passed any combination of
-/// --tests, --examples, --benches or --bins, and we didn't match on any targets.
-/// We want to emit a warning to make sure the user knows that this run is a no-op,
-/// and their code remains unchecked despite cargo not returning any errors
-fn unmatched_target_filters(
-    units: &[Unit],
-    filter: &CompileFilter,
-    shell: &mut Shell,
-) -> CargoResult<()> {
-    if let CompileFilter::Only {
-        all_targets,
-        lib: _,
-        ref bins,
-        ref examples,
-        ref tests,
-        ref benches,
-    } = *filter
-    {
-        if units.is_empty() {
-            let mut filters = String::new();
-            let mut miss_count = 0;
-
-            let mut append = |t: &FilterRule, s| {
-                if let FilterRule::All = *t {
-                    miss_count += 1;
-                    filters.push_str(s);
-                }
-            };
-
-            if all_targets {
-                filters.push_str(" `all-targets`");
-            } else {
-                append(bins, " `bins`,");
-                append(tests, " `tests`,");
-                append(examples, " `examples`,");
-                append(benches, " `benches`,");
-                filters.pop();
-            }
-
-            return shell.warn(format!(
-                "Target {}{} specified, but no targets matched. This is a no-op",
-                if miss_count > 1 { "filters" } else { "filter" },
-                filters,
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Warns if a target's required-features references a feature that doesn't exist.
-///
-/// This is a warning because historically this was not validated, and it
-/// would cause too much breakage to make it an error.
-fn validate_required_features(
-    resolve: &Option<Resolve>,
-    target_name: &str,
-    required_features: &[String],
-    summary: &Summary,
-    shell: &mut Shell,
-) -> CargoResult<()> {
-    let resolve = match resolve {
-        None => return Ok(()),
-        Some(resolve) => resolve,
-    };
-
-    for feature in required_features {
-        let fv = FeatureValue::new(feature.into());
-        match &fv {
-            FeatureValue::Feature(f) => {
-                if !summary.features().contains_key(f) {
-                    shell.warn(format!(
-                        "invalid feature `{}` in required-features of target `{}`: \
-                        `{}` is not present in [features] section",
-                        fv, target_name, fv
-                    ))?;
-                }
-            }
-            FeatureValue::Dep { .. } => {
-                anyhow::bail!(
-                    "invalid feature `{}` in required-features of target `{}`: \
-                    `dep:` prefixed feature values are not allowed in required-features",
-                    fv,
-                    target_name
-                );
-            }
-            FeatureValue::DepFeature { weak: true, .. } => {
-                anyhow::bail!(
-                    "invalid feature `{}` in required-features of target `{}`: \
-                    optional dependency with `?` is not allowed in required-features",
-                    fv,
-                    target_name
-                );
-            }
-            // Handling of dependent_crate/dependent_crate_feature syntax
-            FeatureValue::DepFeature {
-                dep_name,
-                dep_feature,
-                weak: false,
-            } => {
-                match resolve
-                    .deps(summary.package_id())
-                    .find(|(_dep_id, deps)| deps.iter().any(|dep| dep.name_in_toml() == *dep_name))
-                {
-                    Some((dep_id, _deps)) => {
-                        let dep_summary = resolve.summary(dep_id);
-                        if !dep_summary.features().contains_key(dep_feature)
-                            && !dep_summary
-                                .dependencies()
-                                .iter()
-                                .any(|dep| dep.name_in_toml() == *dep_feature && dep.is_optional())
-                        {
-                            shell.warn(format!(
-                                "invalid feature `{}` in required-features of target `{}`: \
-                                feature `{}` does not exist in package `{}`",
-                                fv, target_name, dep_feature, dep_id
-                            ))?;
-                        }
-                    }
-                    None => {
-                        shell.warn(format!(
-                            "invalid feature `{}` in required-features of target `{}`: \
-                            dependency `{}` does not exist",
-                            fv, target_name, dep_name
-                        ))?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Gets all of the features enabled for a package, plus its dependencies'
-/// features.
-///
-/// Dependencies are added as `dep_name/feat_name` because `required-features`
-/// wants to support that syntax.
-pub fn resolve_all_features(
-    resolve_with_overrides: &Resolve,
-    resolved_features: &features::ResolvedFeatures,
-    package_set: &PackageSet<'_>,
-    package_id: PackageId,
-) -> HashSet<String> {
-    let mut features: HashSet<String> = resolved_features
-        .activated_features(package_id, FeaturesFor::NormalOrDev)
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    // Include features enabled for use by dependencies so targets can also use them with the
-    // required-features field when deciding whether to be built or skipped.
-    for (dep_id, deps) in resolve_with_overrides.deps(package_id) {
-        let is_proc_macro = package_set
-            .get_one(dep_id)
-            .expect("packages downloaded")
-            .proc_macro();
-        for dep in deps {
-            let features_for = FeaturesFor::from_for_host(is_proc_macro || dep.is_build());
-            for feature in resolved_features
-                .activated_features_unverified(dep_id, features_for)
-                .unwrap_or_default()
-            {
-                features.insert(format!("{}/{}", dep.name_in_toml(), feature));
-            }
-        }
-    }
-
-    features
-}
-
-/// Given a list of all targets for a package, filters out only the targets
-/// that are automatically included when the user doesn't specify any targets.
-fn filter_default_targets(targets: &[Target], mode: CompileMode) -> Vec<&Target> {
-    match mode {
-        CompileMode::Bench => targets.iter().filter(|t| t.benched()).collect(),
-        CompileMode::Test => targets
-            .iter()
-            .filter(|t| t.tested() || t.is_example())
-            .collect(),
-        CompileMode::Build | CompileMode::Check { .. } => targets
-            .iter()
-            .filter(|t| t.is_bin() || t.is_lib())
-            .collect(),
-        CompileMode::Doc { .. } => {
-            // `doc` does lib and bins (bin with same name as lib is skipped).
-            targets
-                .iter()
-                .filter(|t| {
-                    t.documented()
-                        && (!t.is_bin()
-                            || !targets.iter().any(|l| l.is_lib() && l.name() == t.name()))
-                })
-                .collect()
-        }
-        CompileMode::Doctest | CompileMode::Docscrape | CompileMode::RunCustomBuild => {
-            panic!("Invalid mode {:?}", mode)
-        }
-    }
-}
-
-/// Returns a list of proposed targets based on command-line target selection flags.
-fn list_rule_targets<'a>(
-    packages: &[&'a Package],
-    rule: &FilterRule,
-    target_desc: &'static str,
-    is_expected_kind: fn(&Target) -> bool,
-    mode: CompileMode,
-) -> CargoResult<Vec<Proposal<'a>>> {
-    let mut proposals = Vec::new();
-    match rule {
-        FilterRule::All => {
-            proposals.extend(filter_targets(packages, is_expected_kind, false, mode))
-        }
-        FilterRule::Just(names) => {
-            for name in names {
-                proposals.extend(find_named_targets(
-                    packages,
-                    name,
-                    target_desc,
-                    is_expected_kind,
-                    mode,
-                )?);
-            }
-        }
-    }
-    Ok(proposals)
-}
-
-/// Finds the targets for a specifically named target.
-fn find_named_targets<'a>(
-    packages: &[&'a Package],
-    target_name: &str,
-    target_desc: &'static str,
-    is_expected_kind: fn(&Target) -> bool,
-    mode: CompileMode,
-) -> CargoResult<Vec<Proposal<'a>>> {
-    let is_glob = is_glob_pattern(target_name);
-    let proposals = if is_glob {
-        let pattern = build_glob(target_name)?;
-        let filter = |t: &Target| is_expected_kind(t) && pattern.matches(t.name());
-        filter_targets(packages, filter, true, mode)
-    } else {
-        let filter = |t: &Target| t.name() == target_name && is_expected_kind(t);
-        filter_targets(packages, filter, true, mode)
-    };
-
-    if proposals.is_empty() {
-        let targets = packages
-            .iter()
-            .flat_map(|pkg| {
-                pkg.targets()
-                    .iter()
-                    .filter(|target| is_expected_kind(target))
-            })
-            .collect::<Vec<_>>();
-        let suggestion = closest_msg(target_name, targets.iter(), |t| t.name());
-        if !suggestion.is_empty() {
-            anyhow::bail!(
-                "no {} target {} `{}`{}",
-                target_desc,
-                if is_glob { "matches pattern" } else { "named" },
-                target_name,
-                suggestion
-            );
-        } else {
-            let mut msg = String::new();
-            writeln!(
-                msg,
-                "no {} target {} `{}`.",
-                target_desc,
-                if is_glob { "matches pattern" } else { "named" },
-                target_name,
-            )?;
-            if !targets.is_empty() {
-                writeln!(msg, "Available {} targets:", target_desc)?;
-                for target in targets {
-                    writeln!(msg, "    {}", target.name())?;
-                }
-            }
-            anyhow::bail!(msg);
-        }
-    }
-    Ok(proposals)
-}
-
-fn filter_targets<'a>(
-    packages: &[&'a Package],
-    predicate: impl Fn(&Target) -> bool,
-    requires_features: bool,
-    mode: CompileMode,
-) -> Vec<Proposal<'a>> {
-    let mut proposals = Vec::new();
-    for pkg in packages {
-        for target in pkg.targets().iter().filter(|t| predicate(t)) {
-            proposals.push(Proposal {
-                pkg,
-                target,
-                requires_features,
-                mode,
-            });
-        }
-    }
-    proposals
-}
-
 /// This is used to rebuild the unit graph, sharing host dependencies if possible.
 ///
 /// This will translate any unit's `CompileKind::Target(host)` to
-/// `CompileKind::Host` if the kind is equal to `to_host`. This also handles
-/// generating the unit `dep_hash`, and merging shared units if possible.
+/// `CompileKind::Host` if `to_host` is not `None` and the kind is equal to `to_host`.
+/// This also handles generating the unit `dep_hash`, and merging shared units if possible.
 ///
 /// This is necessary because if normal dependencies used `CompileKind::Host`,
 /// there would be no way to distinguish those units from build-dependency
-/// units. This can cause a problem if a shared normal/build dependency needs
+/// units or artifact dependency units.
+/// This can cause a problem if a shared normal/build/artifact dependency needs
 /// to link to another dependency whose features differ based on whether or
-/// not it is a normal or build dependency. If both units used
+/// not it is a normal, build or artifact dependency. If all units used
 /// `CompileKind::Host`, then they would end up being identical, causing a
 /// collision in the `UnitGraph`, and Cargo would end up randomly choosing one
 /// value or the other.
 ///
-/// The solution is to keep normal and build dependencies separate when
+/// The solution is to keep normal, build and artifact dependencies separate when
 /// building the unit graph, and then run this second pass which will try to
 /// combine shared dependencies safely. By adding a hash of the dependencies
 /// to the `Unit`, this allows the `CompileKind` to be changed back to `Host`
-/// without fear of an unwanted collision.
+/// and `artifact_target_for_features` to be removed without fear of an unwanted
+/// collision for build or artifact dependencies.
 fn rebuild_unit_graph_shared(
     interner: &UnitInterner,
     unit_graph: UnitGraph,
     roots: &[Unit],
     scrape_units: &[Unit],
-    to_host: CompileKind,
+    to_host: Option<CompileKind>,
 ) -> (Vec<Unit>, Vec<Unit>, UnitGraph) {
     let mut result = UnitGraph::new();
     // Map of the old unit to the new unit, used to avoid recursing into units
@@ -1229,9 +582,20 @@ fn rebuild_unit_graph_shared(
     let new_roots = roots
         .iter()
         .map(|root| {
-            traverse_and_share(interner, &mut memo, &mut result, &unit_graph, root, to_host)
+            traverse_and_share(
+                interner,
+                &mut memo,
+                &mut result,
+                &unit_graph,
+                root,
+                false,
+                to_host,
+            )
         })
         .collect();
+    // If no unit in the unit graph ended up having scrape units attached as dependencies,
+    // then they won't have been discovered in traverse_and_share and hence won't be in
+    // memo. So we filter out missing scrape units.
     let new_scrape_units = scrape_units
         .iter()
         .map(|unit| memo.get(unit).unwrap().clone())
@@ -1250,7 +614,8 @@ fn traverse_and_share(
     new_graph: &mut UnitGraph,
     unit_graph: &UnitGraph,
     unit: &Unit,
-    to_host: CompileKind,
+    unit_is_for_host: bool,
+    to_host: Option<CompileKind>,
 ) -> Unit {
     if let Some(new_unit) = memo.get(unit) {
         // Already computed, no need to recompute.
@@ -1260,8 +625,15 @@ fn traverse_and_share(
     let new_deps: Vec<_> = unit_graph[unit]
         .iter()
         .map(|dep| {
-            let new_dep_unit =
-                traverse_and_share(interner, memo, new_graph, unit_graph, &dep.unit, to_host);
+            let new_dep_unit = traverse_and_share(
+                interner,
+                memo,
+                new_graph,
+                unit_graph,
+                &dep.unit,
+                dep.unit_for.is_for_host(),
+                to_host,
+            );
             new_dep_unit.hash(&mut dep_hash);
             UnitDep {
                 unit: new_dep_unit,
@@ -1269,22 +641,75 @@ fn traverse_and_share(
             }
         })
         .collect();
+    // Here, we have recursively traversed this unit's dependencies, and hashed them: we can
+    // finalize the dep hash.
     let new_dep_hash = dep_hash.finish();
-    let new_kind = if unit.kind == to_host {
-        CompileKind::Host
-    } else {
-        unit.kind
+
+    // This is the key part of the sharing process: if the unit is a runtime dependency, whose
+    // target is the same as the host, we canonicalize the compile kind to `CompileKind::Host`.
+    // A possible host dependency counterpart to this unit would have that kind, and if such a unit
+    // exists in the current `unit_graph`, they will unify in the new unit graph map `new_graph`.
+    // The resulting unit graph will be optimized with less units, thanks to sharing these host
+    // dependencies.
+    let canonical_kind = match to_host {
+        Some(to_host) if to_host == unit.kind => CompileKind::Host,
+        _ => unit.kind,
     };
+
+    let mut profile = unit.profile.clone();
+
+    // If this is a build dependency, and it's not shared with runtime dependencies, we can weaken
+    // its debuginfo level to optimize build times. We do nothing if it's an artifact dependency,
+    // as it and its debuginfo may end up embedded in the main program.
+    if unit_is_for_host
+        && to_host.is_some()
+        && profile.debuginfo.is_deferred()
+        && !unit.artifact.is_true()
+    {
+        // We create a "probe" test to see if a unit with the same explicit debuginfo level exists
+        // in the graph. This is the level we'd expect if it was set manually or the default value
+        // set by a profile for a runtime dependency: its canonical value.
+        let canonical_debuginfo = profile.debuginfo.finalize();
+        let mut canonical_profile = profile.clone();
+        canonical_profile.debuginfo = canonical_debuginfo;
+        let unit_probe = interner.intern(
+            &unit.pkg,
+            &unit.target,
+            canonical_profile,
+            to_host.unwrap(),
+            unit.mode,
+            unit.features.clone(),
+            unit.is_std,
+            unit.dep_hash,
+            unit.artifact,
+            unit.artifact_target_for_features,
+        );
+
+        // We can now turn the deferred value into its actual final value.
+        profile.debuginfo = if unit_graph.contains_key(&unit_probe) {
+            // The unit is present in both build time and runtime subgraphs: we canonicalize its
+            // level to the other unit's, thus ensuring reuse between the two to optimize build times.
+            canonical_debuginfo
+        } else {
+            // The unit is only present in the build time subgraph, we can weaken its debuginfo
+            // level to optimize build times.
+            canonical_debuginfo.weaken()
+        }
+    }
+
     let new_unit = interner.intern(
         &unit.pkg,
         &unit.target,
-        unit.profile.clone(),
-        new_kind,
+        profile,
+        canonical_kind,
         unit.mode,
         unit.features.clone(),
         unit.is_std,
         new_dep_hash,
         unit.artifact,
+        // Since `dep_hash` is now filled in, there's no need to specify the artifact target
+        // for target-dependent feature resolution
+        None,
     );
     assert!(memo.insert(unit.clone(), new_unit.clone()).is_none());
     new_graph.entry(new_unit.clone()).or_insert(new_deps);
@@ -1443,6 +868,7 @@ fn override_rustc_crate_types(
             unit.is_std,
             unit.dep_hash,
             unit.artifact,
+            unit.artifact_target_for_features,
         )
     };
     units[0] = match unit.target.kind() {
@@ -1457,4 +883,42 @@ fn override_rustc_crate_types(
     };
 
     Ok(())
+}
+
+/// Gets all of the features enabled for a package, plus its dependencies'
+/// features.
+///
+/// Dependencies are added as `dep_name/feat_name` because `required-features`
+/// wants to support that syntax.
+pub fn resolve_all_features(
+    resolve_with_overrides: &Resolve,
+    resolved_features: &features::ResolvedFeatures,
+    package_set: &PackageSet<'_>,
+    package_id: PackageId,
+) -> HashSet<String> {
+    let mut features: HashSet<String> = resolved_features
+        .activated_features(package_id, FeaturesFor::NormalOrDev)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // Include features enabled for use by dependencies so targets can also use them with the
+    // required-features field when deciding whether to be built or skipped.
+    for (dep_id, deps) in resolve_with_overrides.deps(package_id) {
+        let is_proc_macro = package_set
+            .get_one(dep_id)
+            .expect("packages downloaded")
+            .proc_macro();
+        for dep in deps {
+            let features_for = FeaturesFor::from_for_host(is_proc_macro || dep.is_build());
+            for feature in resolved_features
+                .activated_features_unverified(dep_id, features_for)
+                .unwrap_or_default()
+            {
+                features.insert(format!("{}/{}", dep.name_in_toml(), feature));
+            }
+        }
+    }
+
+    features
 }

@@ -5,14 +5,19 @@ use cargo_util::paths::append;
 use cargo_util::Sha256;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use pasetors::keys::{AsymmetricPublicKey, AsymmetricSecretKey};
+use pasetors::paserk::FormatAsPaserk;
+use pasetors::token::UntrustedToken;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::thread;
+use std::path::{Path, PathBuf};
+use std::thread::{self, JoinHandle};
 use tar::{Builder, Header};
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
 use url::Url;
 
 /// Gets the path to the local index pretending to be crates.io. This is a Git repo
@@ -55,12 +60,34 @@ fn generate_url(name: &str) -> Url {
     Url::from_file_path(generate_path(name)).ok().unwrap()
 }
 
+#[derive(Clone)]
+pub enum Token {
+    Plaintext(String),
+    Keys(String, Option<String>),
+}
+
+impl Token {
+    /// This is a valid PASETO secret key.
+    /// This one is already publicly available as part of the text of the RFC so is safe to use for tests.
+    pub fn rfc_key() -> Token {
+        Token::Keys(
+            "k3.secret.fNYVuMvBgOlljt9TDohnaYLblghqaHoQquVZwgR6X12cBFHZLFsaU3q7X3k1Zn36"
+                .to_string(),
+            Some("sub".to_string()),
+        )
+    }
+}
+
+type RequestCallback = Box<dyn Send + Fn(&Request, &HttpServer) -> Response>;
+
 /// A builder for initializing registries.
 pub struct RegistryBuilder {
     /// If set, configures an alternate registry with the given name.
     alternative: Option<String>,
-    /// If set, the authorization token for the registry.
-    token: Option<String>,
+    /// The authorization token for the registry.
+    token: Option<Token>,
+    /// If set, the registry requires authorization for all operations.
+    auth_required: bool,
     /// If set, serves the index over http.
     http_index: bool,
     /// If set, serves the API over http.
@@ -72,16 +99,20 @@ pub struct RegistryBuilder {
     /// Write the registry in configuration.
     configure_registry: bool,
     /// API responders.
-    custom_responders: HashMap<&'static str, Box<dyn Send + Fn(&Request, &HttpServer) -> Response>>,
+    custom_responders: HashMap<String, RequestCallback>,
+    /// Handler for 404 responses.
+    not_found_handler: RequestCallback,
+    /// If nonzero, the git index update to be delayed by the given number of seconds.
+    delayed_index_update: usize,
 }
 
 pub struct TestRegistry {
-    _server: Option<HttpServerHandle>,
+    server: Option<HttpServerHandle>,
     index_url: Url,
     path: PathBuf,
     api_url: Url,
     dl_url: Url,
-    token: Option<String>,
+    token: Token,
 }
 
 impl TestRegistry {
@@ -94,24 +125,53 @@ impl TestRegistry {
     }
 
     pub fn token(&self) -> &str {
-        self.token
-            .as_deref()
-            .expect("registry was not configured with a token")
+        match &self.token {
+            Token::Plaintext(s) => s,
+            Token::Keys(_, _) => panic!("registry was not configured with a plaintext token"),
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        match &self.token {
+            Token::Plaintext(_) => panic!("registry was not configured with a secret key"),
+            Token::Keys(s, _) => s,
+        }
+    }
+
+    /// Shutdown the server thread and wait for it to stop.
+    /// `Drop` automatically stops the server, but this additionally
+    /// waits for the thread to stop.
+    pub fn join(self) {
+        if let Some(mut server) = self.server {
+            server.stop();
+            let handle = server.handle.take().unwrap();
+            handle.join().unwrap();
+        }
     }
 }
 
 impl RegistryBuilder {
     #[must_use]
     pub fn new() -> RegistryBuilder {
+        let not_found = |_req: &Request, _server: &HttpServer| -> Response {
+            Response {
+                code: 404,
+                headers: vec![],
+                body: b"not found".to_vec(),
+            }
+        };
         RegistryBuilder {
             alternative: None,
             token: None,
+            auth_required: false,
             http_api: false,
             http_index: false,
             api: true,
             configure_registry: true,
             configure_token: true,
             custom_responders: HashMap::new(),
+            not_found_handler: Box::new(not_found),
+            delayed_index_update: 0,
         }
     }
 
@@ -119,10 +179,27 @@ impl RegistryBuilder {
     #[must_use]
     pub fn add_responder<R: 'static + Send + Fn(&Request, &HttpServer) -> Response>(
         mut self,
-        url: &'static str,
+        url: impl Into<String>,
         responder: R,
     ) -> Self {
-        self.custom_responders.insert(url, Box::new(responder));
+        self.custom_responders
+            .insert(url.into(), Box::new(responder));
+        self
+    }
+
+    #[must_use]
+    pub fn not_found_handler<R: 'static + Send + Fn(&Request, &HttpServer) -> Response>(
+        mut self,
+        responder: R,
+    ) -> Self {
+        self.not_found_handler = Box::new(responder);
+        self
+    }
+
+    /// Configures the git index update to be delayed by the given number of seconds.
+    #[must_use]
+    pub fn delayed_index_update(mut self, delay: usize) -> Self {
+        self.delayed_index_update = delay;
         self
     }
 
@@ -155,8 +232,16 @@ impl RegistryBuilder {
 
     /// Sets the token value
     #[must_use]
-    pub fn token(mut self, token: &str) -> Self {
-        self.token = Some(token.to_string());
+    pub fn token(mut self, token: Token) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    /// Sets this registry to require the authentication token for
+    /// all operations.
+    #[must_use]
+    pub fn auth_required(mut self) -> Self {
+        self.auth_required = true;
         self
     }
 
@@ -197,7 +282,9 @@ impl RegistryBuilder {
         let dl_url = generate_url(&format!("{prefix}dl"));
         let dl_path = generate_path(&format!("{prefix}dl"));
         let api_path = generate_path(&format!("{prefix}api"));
-        let token = Some(self.token.unwrap_or_else(|| format!("{prefix}sekrit")));
+        let token = self
+            .token
+            .unwrap_or_else(|| Token::Plaintext(format!("{prefix}sekrit")));
 
         let (server, index_url, api_url, dl_url) = if !self.http_index && !self.http_api {
             // No need to start the HTTP server.
@@ -206,8 +293,12 @@ impl RegistryBuilder {
             let server = HttpServer::new(
                 registry_path.clone(),
                 dl_path,
+                api_path.clone(),
                 token.clone(),
+                self.auth_required,
                 self.custom_responders,
+                self.not_found_handler,
+                self.delayed_index_update,
             );
             let index_url = if self.http_index {
                 server.index_url()
@@ -226,7 +317,7 @@ impl RegistryBuilder {
         let registry = TestRegistry {
             api_url,
             index_url,
-            _server: server,
+            server,
             dl_url,
             path: registry_path,
             token,
@@ -238,8 +329,8 @@ impl RegistryBuilder {
                     &config_path,
                     format!(
                         "
-                    [registries.{alternative}]
-                    index = '{}'",
+                        [registries.{alternative}]
+                        index = '{}'",
                         registry.index_url
                     )
                     .as_bytes(),
@@ -250,11 +341,11 @@ impl RegistryBuilder {
                     &config_path,
                     format!(
                         "
-                    [source.crates-io]
-                    replace-with = 'dummy-registry'
+                        [source.crates-io]
+                        replace-with = 'dummy-registry'
 
-                    [registries.dummy-registry]
-                    index = '{}'",
+                        [registries.dummy-registry]
+                        index = '{}'",
                         registry.index_url
                     )
                     .as_bytes(),
@@ -264,35 +355,56 @@ impl RegistryBuilder {
         }
 
         if self.configure_token {
-            let token = registry.token.as_deref().unwrap();
-            let credentials = paths::home().join(".cargo/credentials");
-            if let Some(alternative) = &self.alternative {
-                append(
-                    &credentials,
-                    format!(
-                        r#"
-                    [registries.{alternative}]
-                    token = "{token}"
-                "#
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-            } else {
-                append(
-                    &credentials,
-                    format!(
-                        r#"
-                    [registry]
-                    token = "{token}"
-                "#
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
+            let credentials = paths::home().join(".cargo/credentials.toml");
+            match &registry.token {
+                Token::Plaintext(token) => {
+                    if let Some(alternative) = &self.alternative {
+                        append(
+                            &credentials,
+                            format!(
+                                r#"
+                                    [registries.{alternative}]
+                                    token = "{token}"
+                                "#
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                    } else {
+                        append(
+                            &credentials,
+                            format!(
+                                r#"
+                                    [registry]
+                                    token = "{token}"
+                                "#
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                    }
+                }
+                Token::Keys(key, subject) => {
+                    let mut out = if let Some(alternative) = &self.alternative {
+                        format!("\n[registries.{alternative}]\n")
+                    } else {
+                        format!("\n[registry]\n")
+                    };
+                    out += &format!("secret-key = \"{key}\"\n");
+                    if let Some(subject) = subject {
+                        out += &format!("secret-key-subject = \"{subject}\"\n");
+                    }
+
+                    append(&credentials, out.as_bytes()).unwrap();
+                }
             }
         }
 
+        let auth = if self.auth_required {
+            r#","auth-required":true"#
+        } else {
+            ""
+        };
         let api = if self.api {
             format!(r#","api":"{}""#, registry.api_url)
         } else {
@@ -302,7 +414,7 @@ impl RegistryBuilder {
         repo(&registry.path)
             .file(
                 "config.json",
-                &format!(r#"{{"dl":"{}"{api}}}"#, registry.dl_url),
+                &format!(r#"{{"dl":"{}"{api}{auth}}}"#, registry.dl_url),
             )
             .build();
         fs::create_dir_all(api_path.join("api/v1/crates")).unwrap();
@@ -338,7 +450,10 @@ impl RegistryBuilder {
 /// `VendorPackage` which implements directory sources.
 ///
 /// # Example
-/// ```
+/// ```no_run
+/// use cargo_test_support::registry::Package;
+/// use cargo_test_support::project;
+///
 /// // Publish package "a" depending on "b".
 /// Package::new("a", "1.0.0")
 ///     .dep("b", "1.0.0")
@@ -442,6 +557,7 @@ pub fn alt_init() -> TestRegistry {
 
 pub struct HttpServerHandle {
     addr: SocketAddr,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl HttpServerHandle {
@@ -456,10 +572,8 @@ impl HttpServerHandle {
     pub fn dl_url(&self) -> Url {
         Url::parse(&format!("http://{}/dl", self.addr.to_string())).unwrap()
     }
-}
 
-impl Drop for HttpServerHandle {
-    fn drop(&mut self) {
+    fn stop(&self) {
         if let Ok(mut stream) = TcpStream::connect(self.addr) {
             // shutdown the server
             let _ = stream.write_all(b"stop");
@@ -468,7 +582,14 @@ impl Drop for HttpServerHandle {
     }
 }
 
+impl Drop for HttpServerHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Request to the test http server
+#[derive(Clone)]
 pub struct Request {
     pub url: Url,
     pub method: String,
@@ -502,19 +623,34 @@ pub struct HttpServer {
     listener: TcpListener,
     registry_path: PathBuf,
     dl_path: PathBuf,
-    token: Option<String>,
-    custom_responders: HashMap<&'static str, Box<dyn Send + Fn(&Request, &HttpServer) -> Response>>,
+    api_path: PathBuf,
+    addr: SocketAddr,
+    token: Token,
+    auth_required: bool,
+    custom_responders: HashMap<String, RequestCallback>,
+    not_found_handler: RequestCallback,
+    delayed_index_update: usize,
+}
+
+/// A helper struct that collects the arguments for [`HttpServer::check_authorized`].
+/// Based on looking at the request, these are the fields that the authentication header should attest to.
+struct Mutation<'a> {
+    mutation: &'a str,
+    name: Option<&'a str>,
+    vers: Option<&'a str>,
+    cksum: Option<&'a str>,
 }
 
 impl HttpServer {
     pub fn new(
         registry_path: PathBuf,
         dl_path: PathBuf,
-        token: Option<String>,
-        api_responders: HashMap<
-            &'static str,
-            Box<dyn Send + Fn(&Request, &HttpServer) -> Response>,
-        >,
+        api_path: PathBuf,
+        token: Token,
+        auth_required: bool,
+        custom_responders: HashMap<String, RequestCallback>,
+        not_found_handler: RequestCallback,
+        delayed_index_update: usize,
     ) -> HttpServerHandle {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -522,11 +658,16 @@ impl HttpServer {
             listener,
             registry_path,
             dl_path,
+            api_path,
+            addr,
             token,
-            custom_responders: api_responders,
+            auth_required,
+            custom_responders,
+            not_found_handler,
+            delayed_index_update,
         };
-        thread::spawn(move || server.start());
-        HttpServerHandle { addr }
+        let handle = Some(thread::spawn(move || server.start()));
+        HttpServerHandle { addr, handle }
     }
 
     fn start(&self) {
@@ -611,17 +752,135 @@ impl HttpServer {
         }
     }
 
-    /// Route the request
-    fn route(&self, req: &Request) -> Response {
-        let authorized = |mutatation: bool| {
-            if mutatation {
-                self.token == req.authorization
-            } else {
-                assert!(req.authorization.is_none(), "unexpected token");
-                true
+    fn check_authorized(&self, req: &Request, mutation: Option<Mutation>) -> bool {
+        let (private_key, private_key_subject) = if mutation.is_some() || self.auth_required {
+            match &self.token {
+                Token::Plaintext(token) => return Some(token) == req.authorization.as_ref(),
+                Token::Keys(private_key, private_key_subject) => {
+                    (private_key.as_str(), private_key_subject)
+                }
             }
+        } else {
+            assert!(req.authorization.is_none(), "unexpected token");
+            return true;
         };
 
+        macro_rules! t {
+            ($e:expr) => {
+                match $e {
+                    Some(e) => e,
+                    None => return false,
+                }
+            };
+        }
+
+        let secret: AsymmetricSecretKey<pasetors::version3::V3> = private_key.try_into().unwrap();
+        let public: AsymmetricPublicKey<pasetors::version3::V3> = (&secret).try_into().unwrap();
+        let pub_key_id: pasetors::paserk::Id = (&public).into();
+        let mut paserk_pub_key_id = String::new();
+        FormatAsPaserk::fmt(&pub_key_id, &mut paserk_pub_key_id).unwrap();
+        // https://github.com/rust-lang/rfcs/blob/master/text/3231-cargo-asymmetric-tokens.md#how-the-registry-server-will-validate-an-asymmetric-token
+
+        // - The PASETO is in v3.public format.
+        let authorization = t!(&req.authorization);
+        let untrusted_token = t!(
+            UntrustedToken::<pasetors::Public, pasetors::version3::V3>::try_from(authorization)
+                .ok()
+        );
+
+        // - The PASETO validates using the public key it looked up based on the key ID.
+        #[derive(serde::Deserialize, Debug)]
+        struct Footer<'a> {
+            url: &'a str,
+            kip: &'a str,
+        }
+        let footer: Footer = t!(serde_json::from_slice(untrusted_token.untrusted_footer()).ok());
+        if footer.kip != paserk_pub_key_id {
+            return false;
+        }
+        let trusted_token =
+            t!(
+                pasetors::version3::PublicToken::verify(&public, &untrusted_token, None, None,)
+                    .ok()
+            );
+
+        // - The URL matches the registry base URL
+        if footer.url != "https://github.com/rust-lang/crates.io-index"
+            && footer.url != &format!("sparse+http://{}/index/", self.addr.to_string())
+        {
+            dbg!(footer.url);
+            return false;
+        }
+
+        // - The PASETO is still within its valid time period.
+        #[derive(serde::Deserialize)]
+        struct Message<'a> {
+            iat: &'a str,
+            sub: Option<&'a str>,
+            mutation: Option<&'a str>,
+            name: Option<&'a str>,
+            vers: Option<&'a str>,
+            cksum: Option<&'a str>,
+            _challenge: Option<&'a str>, // todo: PASETO with challenges
+            v: Option<u8>,
+        }
+        let message: Message = t!(serde_json::from_str(trusted_token.payload()).ok());
+        let token_time = t!(OffsetDateTime::parse(message.iat, &Rfc3339).ok());
+        let now = OffsetDateTime::now_utc();
+        if (now - token_time) > Duration::MINUTE {
+            return false;
+        }
+        if private_key_subject.as_deref() != message.sub {
+            dbg!(message.sub);
+            return false;
+        }
+        // - If the claim v is set, that it has the value of 1.
+        if let Some(v) = message.v {
+            if v != 1 {
+                dbg!(message.v);
+                return false;
+            }
+        }
+        // - If the server issues challenges, that the challenge has not yet been answered.
+        // todo: PASETO with challenges
+        // - If the operation is a mutation:
+        if let Some(mutation) = mutation {
+            //  - That the operation matches the mutation field and is one of publish, yank, or unyank.
+            if message.mutation != Some(mutation.mutation) {
+                dbg!(message.mutation);
+                return false;
+            }
+            //  - That the package, and version match the request.
+            if message.name != mutation.name {
+                dbg!(message.name);
+                return false;
+            }
+            if message.vers != mutation.vers {
+                dbg!(message.vers);
+                return false;
+            }
+            //  - If the mutation is publish, that the version has not already been published, and that the hash matches the request.
+            if mutation.mutation == "publish" {
+                if message.cksum != mutation.cksum {
+                    dbg!(message.cksum);
+                    return false;
+                }
+            }
+        } else {
+            // - If the operation is a read, that the mutation field is not set.
+            if message.mutation.is_some()
+                || message.name.is_some()
+                || message.vers.is_some()
+                || message.cksum.is_some()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Route the request
+    fn route(&self, req: &Request) -> Response {
         // Check for custom responder
         if let Some(responder) = self.custom_responders.get(req.url.path()) {
             return responder(&req, self);
@@ -629,39 +888,53 @@ impl HttpServer {
         let path: Vec<_> = req.url.path()[1..].split('/').collect();
         match (req.method.as_str(), path.as_slice()) {
             ("get", ["index", ..]) => {
-                if !authorized(false) {
+                if !self.check_authorized(req, None) {
                     self.unauthorized(req)
                 } else {
                     self.index(&req)
                 }
             }
             ("get", ["dl", ..]) => {
-                if !authorized(false) {
+                if !self.check_authorized(req, None) {
                     self.unauthorized(req)
                 } else {
                     self.dl(&req)
                 }
             }
             // publish
-            ("put", ["api", "v1", "crates", "new"]) => {
-                if !authorized(true) {
-                    self.unauthorized(req)
-                } else {
-                    self.publish(req)
-                }
-            }
+            ("put", ["api", "v1", "crates", "new"]) => self.check_authorized_publish(req),
             // The remainder of the operators in the test framework do nothing other than responding 'ok'.
             //
             // Note: We don't need to support anything real here because there are no tests that
             // currently require anything other than publishing via the http api.
 
-            // yank
-            ("delete", ["api", "v1", "crates", .., "yank"])
-            // unyank
-            | ("put", ["api", "v1", "crates", .., "unyank"])
+            // yank / unyank
+            ("delete" | "put", ["api", "v1", "crates", crate_name, version, mutation]) => {
+                if !self.check_authorized(
+                    req,
+                    Some(Mutation {
+                        mutation,
+                        name: Some(crate_name),
+                        vers: Some(version),
+                        cksum: None,
+                    }),
+                ) {
+                    self.unauthorized(req)
+                } else {
+                    self.ok(&req)
+                }
+            }
             // owners
-            | ("get" | "put" | "delete", ["api", "v1", "crates", .., "owners"]) => {
-                if !authorized(true) {
+            ("get" | "put" | "delete", ["api", "v1", "crates", crate_name, "owners"]) => {
+                if !self.check_authorized(
+                    req,
+                    Some(Mutation {
+                        mutation: "owners",
+                        name: Some(crate_name),
+                        vers: None,
+                        cksum: None,
+                    }),
+                ) {
                     self.unauthorized(req)
                 } else {
                     self.ok(&req)
@@ -675,18 +948,16 @@ impl HttpServer {
     pub fn unauthorized(&self, _req: &Request) -> Response {
         Response {
             code: 401,
-            headers: vec![],
+            headers: vec![
+                r#"WWW-Authenticate: Cargo login_url="https://test-registry-login/me""#.to_string(),
+            ],
             body: b"Unauthorized message from server.".to_vec(),
         }
     }
 
     /// Not found response
-    pub fn not_found(&self, _req: &Request) -> Response {
-        Response {
-            code: 404,
-            headers: vec![],
-            body: b"not found".to_vec(),
-        }
+    pub fn not_found(&self, req: &Request) -> Response {
+        (self.not_found_handler)(req, self)
     }
 
     /// Respond OK without doing anything
@@ -774,8 +1045,14 @@ impl HttpServer {
         }
     }
 
-    pub fn publish(&self, req: &Request) -> Response {
+    pub fn check_authorized_publish(&self, req: &Request) -> Response {
         if let Some(body) = &req.body {
+            // Mimic the publish behavior for local registries by writing out the request
+            // so tests can verify publishes made to either registry type.
+            let path = self.api_path.join("api/v1/crates/new");
+            t!(fs::create_dir_all(path.parent().unwrap()));
+            t!(fs::write(&path, body));
+
             // Get the metadata of the package
             let (len, remaining) = body.split_at(4);
             let json_len = u32::from_le_bytes(len.try_into().unwrap());
@@ -785,50 +1062,37 @@ impl HttpServer {
             let (len, remaining) = remaining.split_at(4);
             let file_len = u32::from_le_bytes(len.try_into().unwrap());
             let (file, _remaining) = remaining.split_at(file_len as usize);
+            let file_cksum = cksum(&file);
 
-            // Write the `.crate`
+            if !self.check_authorized(
+                req,
+                Some(Mutation {
+                    mutation: "publish",
+                    name: Some(&new_crate.name),
+                    vers: Some(&new_crate.vers),
+                    cksum: Some(&file_cksum),
+                }),
+            ) {
+                return self.unauthorized(req);
+            }
+
             let dst = self
                 .dl_path
                 .join(&new_crate.name)
                 .join(&new_crate.vers)
                 .join("download");
-            t!(fs::create_dir_all(dst.parent().unwrap()));
-            t!(fs::write(&dst, file));
 
-            let deps = new_crate
-                .deps
-                .iter()
-                .map(|dep| {
-                    let (name, package) = match &dep.explicit_name_in_toml {
-                        Some(explicit) => (explicit.to_string(), Some(dep.name.to_string())),
-                        None => (dep.name.to_string(), None),
-                    };
-                    serde_json::json!({
-                        "name": name,
-                        "req": dep.version_req,
-                        "features": dep.features,
-                        "default_features": true,
-                        "target": dep.target,
-                        "optional": dep.optional,
-                        "kind": dep.kind,
-                        "registry": dep.registry,
-                        "package": package,
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            let line = create_index_line(
-                serde_json::json!(new_crate.name),
-                &new_crate.vers,
-                deps,
-                &cksum(file),
-                new_crate.features,
-                false,
-                new_crate.links,
-                None,
-            );
-
-            write_to_index(&self.registry_path, &new_crate.name, line, false);
+            if self.delayed_index_update == 0 {
+                save_new_crate(dst, new_crate, file, file_cksum, &self.registry_path);
+            } else {
+                let delayed_index_update = self.delayed_index_update;
+                let registry_path = self.registry_path.clone();
+                let file = Vec::from(file);
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::new(delayed_index_update as u64, 0));
+                    save_new_crate(dst, new_crate, &file, file_cksum, &registry_path);
+                });
+            }
 
             self.ok(&req)
         } else {
@@ -839,6 +1103,54 @@ impl HttpServer {
             }
         }
     }
+}
+
+fn save_new_crate(
+    dst: PathBuf,
+    new_crate: crates_io::NewCrate,
+    file: &[u8],
+    file_cksum: String,
+    registry_path: &Path,
+) {
+    // Write the `.crate`
+    t!(fs::create_dir_all(dst.parent().unwrap()));
+    t!(fs::write(&dst, file));
+
+    let deps = new_crate
+        .deps
+        .iter()
+        .map(|dep| {
+            let (name, package) = match &dep.explicit_name_in_toml {
+                Some(explicit) => (explicit.to_string(), Some(dep.name.to_string())),
+                None => (dep.name.to_string(), None),
+            };
+            serde_json::json!({
+                "name": name,
+                "req": dep.version_req,
+                "features": dep.features,
+                "default_features": true,
+                "target": dep.target,
+                "optional": dep.optional,
+                "kind": dep.kind,
+                "registry": dep.registry,
+                "package": package,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let line = create_index_line(
+        serde_json::json!(new_crate.name),
+        &new_crate.vers,
+        deps,
+        &file_cksum,
+        new_crate.features,
+        false,
+        new_crate.links,
+        None,
+        None,
+    );
+
+    write_to_index(registry_path, &new_crate.name, line, false);
 }
 
 impl Package {
@@ -932,7 +1244,7 @@ impl Package {
     }
 
     /// Adds a normal dependency. Example:
-    /// ```
+    /// ```toml
     /// [dependencies]
     /// foo = {version = "1.0"}
     /// ```
@@ -941,7 +1253,7 @@ impl Package {
     }
 
     /// Adds a dependency with the given feature. Example:
-    /// ```
+    /// ```toml
     /// [dependencies]
     /// foo = {version = "1.0", "features": ["feat1", "feat2"]}
     /// ```
@@ -950,7 +1262,7 @@ impl Package {
     }
 
     /// Adds a platform-specific dependency. Example:
-    /// ```
+    /// ```toml
     /// [target.'cfg(windows)'.dependencies]
     /// foo = {version = "1.0"}
     /// ```
@@ -964,7 +1276,7 @@ impl Package {
     }
 
     /// Adds a dev-dependency. Example:
-    /// ```
+    /// ```toml
     /// [dev-dependencies]
     /// foo = {version = "1.0"}
     /// ```
@@ -973,7 +1285,7 @@ impl Package {
     }
 
     /// Adds a build-dependency. Example:
-    /// ```
+    /// ```toml
     /// [build-dependencies]
     /// foo = {version = "1.0"}
     /// ```
@@ -1092,6 +1404,7 @@ impl Package {
             self.features.clone(),
             self.yanked,
             self.links.clone(),
+            self.rust_version.as_deref(),
             self.v,
         );
 
@@ -1147,10 +1460,13 @@ impl Package {
         let mut manifest = String::new();
 
         if !self.cargo_features.is_empty() {
-            manifest.push_str(&format!(
-                "cargo-features = {}\n\n",
-                toml_edit::ser::to_item(&self.cargo_features).unwrap()
-            ));
+            let mut features = String::new();
+            serde::Serialize::serialize(
+                &self.cargo_features,
+                toml::ser::ValueSerializer::new(&mut features),
+            )
+            .unwrap();
+            manifest.push_str(&format!("cargo-features = {}\n\n", features));
         }
 
         manifest.push_str(&format!(

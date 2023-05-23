@@ -11,7 +11,7 @@ pub use self::cargo_generate_lockfile::generate_lockfile;
 pub use self::cargo_generate_lockfile::update_lockfile;
 pub use self::cargo_generate_lockfile::UpdateOptions;
 pub use self::cargo_install::{install, install_list};
-pub use self::cargo_new::{init, new, NewOptions, VersionControl};
+pub use self::cargo_new::{init, new, NewOptions, NewProjectKind, VersionControl};
 pub use self::cargo_output_metadata::{output_metadata, ExportInfo, OutputMetadataOptions};
 pub use self::cargo_package::{check_yanked, package, package_one, PackageOpts};
 pub use self::cargo_pkgid::pkgid;
@@ -25,7 +25,7 @@ pub use self::registry::HttpTimeout;
 pub use self::registry::{configure_http_handle, http_handle, http_handle_and_timeout};
 pub use self::registry::{modify_owners, yank, OwnersOptions, PublishOpts};
 pub use self::registry::{needs_custom_http_transport, registry_login, registry_logout, search};
-pub use self::registry::{publish, registry_configuration, RegistryConfig};
+pub use self::registry::{publish, RegistryCredentialConfig};
 pub use self::resolve::{
     add_overrides, get_resolved_packages, resolve_with_previous, resolve_ws, resolve_ws_with_opts,
     WorkspaceResolve,
@@ -34,7 +34,7 @@ pub use self::vendor::{vendor, VendorOptions};
 
 pub mod cargo_add;
 mod cargo_clean;
-mod cargo_compile;
+pub(crate) mod cargo_compile;
 pub mod cargo_config;
 mod cargo_doc;
 mod cargo_fetch;
@@ -51,9 +51,9 @@ mod cargo_test;
 mod cargo_uninstall;
 mod common_for_install_and_uninstall;
 mod fix;
-mod lockfile;
-mod registry;
-mod resolve;
+pub(crate) mod lockfile;
+pub(crate) mod registry;
+pub(crate) mod resolve;
 pub mod tree;
 mod vendor;
 

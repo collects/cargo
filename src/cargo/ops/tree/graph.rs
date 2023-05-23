@@ -362,10 +362,18 @@ fn add_pkg(
                 if !opts.edge_kinds.contains(&EdgeKind::Dep(dep.kind())) {
                     return false;
                 }
+                // Filter out proc-macrcos if requested.
+                if opts.no_proc_macro && graph.package_for_id(dep_id).proc_macro() {
+                    return false;
+                }
                 if dep.is_optional() {
                     // If the new feature resolver does not enable this
                     // optional dep, then don't use it.
-                    if !resolved_features.is_activated(dep_id, features_for) {
+                    if !resolved_features.is_dep_activated(
+                        package_id,
+                        features_for,
+                        dep.name_in_toml(),
+                    ) {
                         return false;
                     }
                 }

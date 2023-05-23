@@ -4,7 +4,7 @@
 
 ## NAME
 
-cargo-remove - Remove dependencies from a Cargo.toml manifest file
+cargo-remove --- Remove dependencies from a Cargo.toml manifest file
 
 ## SYNOPSIS
 
@@ -29,7 +29,8 @@ Remove one or more dependencies from a `Cargo.toml` manifest.
 
 
 <dt class="option-term" id="option-cargo-remove---target"><a class="option-anchor" href="#option-cargo-remove---target"></a><code>--target</code> <em>target</em></dt>
-<dd class="option-desc">Remove as a dependency to the <a href="../reference/specifying-dependencies.html#platform-specific-dependencies">given target platform</a>.</dd>
+<dd class="option-desc">Remove as a dependency to the <a href="../reference/specifying-dependencies.html#platform-specific-dependencies">given target platform</a>.</p>
+<p>To avoid unexpected shell expansions, you may use quotes around each target, e.g., <code>--target 'cfg(unix)'</code>.</dd>
 
 
 </dl>
@@ -39,7 +40,7 @@ Remove one or more dependencies from a `Cargo.toml` manifest.
 <dl>
 
 <dt class="option-term" id="option-cargo-remove---dry-run"><a class="option-anchor" href="#option-cargo-remove---dry-run"></a><code>--dry-run</code></dt>
-<dd class="option-desc">Don't actually write to the manifest.</dd>
+<dd class="option-desc">Don’t actually write to the manifest.</dd>
 
 
 </dl>
@@ -49,7 +50,7 @@ Remove one or more dependencies from a `Cargo.toml` manifest.
 <dl>
 <dt class="option-term" id="option-cargo-remove--v"><a class="option-anchor" href="#option-cargo-remove--v"></a><code>-v</code></dt>
 <dt class="option-term" id="option-cargo-remove---verbose"><a class="option-anchor" href="#option-cargo-remove---verbose"></a><code>--verbose</code></dt>
-<dd class="option-desc">Use verbose output. May be specified twice for &quot;very verbose&quot; output which
+<dd class="option-desc">Use verbose output. May be specified twice for “very verbose” output which
 includes extra output such as dependency warnings and build script output.
 May also be specified with the <code>term.verbose</code>
 <a href="../reference/config.html">config value</a>.</dd>
@@ -115,8 +116,8 @@ offline.</p>
 
 <dl>
 
-<dt class="option-term" id="option-cargo-remove--p"><a class="option-anchor" href="#option-cargo-remove--p"></a><code>-p</code> <em>spec</em>...</dt>
-<dt class="option-term" id="option-cargo-remove---package"><a class="option-anchor" href="#option-cargo-remove---package"></a><code>--package</code> <em>spec</em>...</dt>
+<dt class="option-term" id="option-cargo-remove--p"><a class="option-anchor" href="#option-cargo-remove--p"></a><code>-p</code> <em>spec</em>…</dt>
+<dt class="option-term" id="option-cargo-remove---package"><a class="option-anchor" href="#option-cargo-remove---package"></a><code>--package</code> <em>spec</em>…</dt>
 <dd class="option-desc">Package to remove from.</dd>
 
 
@@ -138,6 +139,17 @@ for more information about how toolchain overrides work.</dd>
 <dd class="option-desc">Overrides a Cargo configuration value. The argument should be in TOML syntax of <code>KEY=VALUE</code>,
 or provided as a path to an extra configuration file. This flag may be specified multiple times.
 See the <a href="../reference/config.html#command-line-overrides">command-line overrides section</a> for more information.</dd>
+
+
+<dt class="option-term" id="option-cargo-remove--C"><a class="option-anchor" href="#option-cargo-remove--C"></a><code>-C</code> <em>PATH</em></dt>
+<dd class="option-desc">Changes the current working directory before executing any specified operations. This affects
+things like where cargo looks by default for the project manifest (<code>Cargo.toml</code>), as well as
+the directories searched for discovering <code>.cargo/config.toml</code>, for example. This option must
+appear before the command name, for example <code>cargo -C path/to/my-project build</code>.</p>
+<p>This option is only available on the <a href="https://doc.rust-lang.org/book/appendix-07-nightly-rust.html">nightly
+channel</a> and
+requires the <code>-Z unstable-options</code> flag to enable (see
+<a href="https://github.com/rust-lang/cargo/issues/10098">#10098</a>).</dd>
 
 
 <dt class="option-term" id="option-cargo-remove--h"><a class="option-anchor" href="#option-cargo-remove--h"></a><code>-h</code></dt>

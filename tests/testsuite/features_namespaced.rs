@@ -1,7 +1,7 @@
 //! Tests for namespaced features.
 
 use super::features2::switch_to_resolver_2;
-use cargo_test_support::registry::{self, Dependency, Package};
+use cargo_test_support::registry::{Dependency, Package, RegistryBuilder};
 use cargo_test_support::{project, publish};
 
 #[cargo_test]
@@ -62,7 +62,7 @@ fn namespaced_invalid_feature() {
         .file("src/main.rs", "")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_status(101)
         .with_stderr(
             "\
@@ -93,7 +93,7 @@ fn namespaced_invalid_dependency() {
         .file("src/main.rs", "")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_status(101)
         .with_stderr(
             "\
@@ -127,7 +127,7 @@ fn namespaced_non_optional_dependency() {
         .file("src/main.rs", "")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
 
         .with_status(101)
         .with_stderr(
@@ -209,7 +209,7 @@ fn namespaced_shadowed_dep() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_status(101)
         .with_stderr(
             "\
@@ -269,7 +269,7 @@ fn namespaced_implicit_non_optional() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("build").with_status(101).with_stderr(
+    p.cargo("check").with_status(101).with_stderr(
         "\
 [ERROR] failed to parse manifest at `[..]`
 
@@ -609,6 +609,7 @@ fn json_exposed() {
                     }
                   ],
                   "workspace_members": "{...}",
+                  "workspace_default_members": "{...}",
                   "resolve": null,
                   "target_directory": "[..]foo/target",
                   "version": 1,
@@ -701,7 +702,7 @@ fn optional_explicit_without_crate() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("build")
+    p.cargo("check")
         .with_status(101)
         .with_stderr(
             "\
@@ -858,8 +859,7 @@ bar v1.0.0
 
 #[cargo_test]
 fn publish_no_implicit() {
-    // HACK below allows us to use a local registry
-    let registry = registry::init();
+    let registry = RegistryBuilder::new().http_api().http_index().build();
 
     // Does not include implicit features or dep: syntax on publish.
     Package::new("opt-dep1", "1.0.0").publish();
@@ -887,15 +887,6 @@ fn publish_no_implicit() {
         .file("src/lib.rs", "")
         .build();
 
-    // HACK: Inject `foo` directly into the index so `publish` won't block for it to be in
-    // the index.
-    //
-    // This is to ensure we can verify the Summary we post to the registry as doing so precludes
-    // the registry from processing the publish.
-    Package::new("foo", "0.1.0")
-        .file("src/lib.rs", "")
-        .publish();
-
     p.cargo("publish --no-verify")
         .replace_crates_io(registry.index_url())
         .with_stderr(
@@ -904,7 +895,10 @@ fn publish_no_implicit() {
 [PACKAGING] foo v0.1.0 [..]
 [PACKAGED] [..]
 [UPLOADING] foo v0.1.0 [..]
-[UPDATING] [..]
+[UPLOADED] foo v0.1.0 [..]
+note: Waiting [..]
+You may press ctrl-c [..]
+[PUBLISHED] foo v0.1.0 [..]
 ",
         )
         .run();
@@ -949,6 +943,7 @@ fn publish_no_implicit() {
           "readme": null,
           "readme_file": null,
           "repository": null,
+          "rust_version": null,
           "vers": "0.1.0"
           }
         "#,
@@ -984,8 +979,7 @@ feat = ["opt-dep1"]
 
 #[cargo_test]
 fn publish() {
-    // HACK below allows us to use a local registry
-    let registry = registry::init();
+    let registry = RegistryBuilder::new().http_api().http_index().build();
 
     // Publish behavior with explicit dep: syntax.
     Package::new("bar", "1.0.0").publish();
@@ -1012,15 +1006,6 @@ fn publish() {
         .file("src/lib.rs", "")
         .build();
 
-    // HACK: Inject `foo` directly into the index so `publish` won't block for it to be in
-    // the index.
-    //
-    // This is to ensure we can verify the Summary we post to the registry as doing so precludes
-    // the registry from processing the publish.
-    Package::new("foo", "0.1.0")
-        .file("src/lib.rs", "")
-        .publish();
-
     p.cargo("publish")
         .replace_crates_io(registry.index_url())
         .with_stderr(
@@ -1028,11 +1013,15 @@ fn publish() {
 [UPDATING] [..]
 [PACKAGING] foo v0.1.0 [..]
 [VERIFYING] foo v0.1.0 [..]
+[UPDATING] [..]
 [COMPILING] foo v0.1.0 [..]
 [FINISHED] [..]
 [PACKAGED] [..]
 [UPLOADING] foo v0.1.0 [..]
-[UPDATING] [..]
+[UPLOADED] foo v0.1.0 [..]
+note: Waiting [..]
+You may press ctrl-c [..]
+[PUBLISHED] foo v0.1.0 [..]
 ",
         )
         .run();
@@ -1070,6 +1059,7 @@ fn publish() {
           "readme": null,
           "readme_file": null,
           "repository": null,
+          "rust_version": null,
           "vers": "0.1.0"
           }
         "#,
@@ -1224,5 +1214,83 @@ Caused by:
       \"dep:bar\", \"bar/bar-feat\"
 ",
         )
+        .run();
+}
+
+#[cargo_test]
+fn dep_feature_when_hidden() {
+    // Checks for behavior with dep:bar and bar/feat syntax when there is no
+    // `bar` feature.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+
+                [dependencies]
+                bar = { path = "bar", optional = true }
+
+                [features]
+                f1 = ["dep:bar"]
+                f2 = ["bar/bar_feat"]
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.1.0"
+
+                [features]
+                bar_feat = []
+            "#,
+        )
+        .file("bar/src/lib.rs", "")
+        .build();
+
+    p.cargo("tree -f")
+        .arg("{p} features={f}")
+        .with_stdout(
+            "\
+foo v0.1.0 ([ROOT]/foo) features=",
+        )
+        .with_stderr("")
+        .run();
+
+    p.cargo("tree -F f1 -f")
+        .arg("{p} features={f}")
+        .with_stdout(
+            "\
+foo v0.1.0 ([ROOT]/foo) features=f1
+└── bar v0.1.0 ([ROOT]/foo/bar) features=
+",
+        )
+        .with_stderr("")
+        .run();
+
+    p.cargo("tree -F f2 -f")
+        .arg("{p} features={f}")
+        .with_stdout(
+            "\
+foo v0.1.0 ([ROOT]/foo) features=f2
+└── bar v0.1.0 ([ROOT]/foo/bar) features=bar_feat
+",
+        )
+        .with_stderr("")
+        .run();
+
+    p.cargo("tree --all-features -f")
+        .arg("{p} features={f}")
+        .with_stdout(
+            "\
+foo v0.1.0 ([ROOT]/foo) features=f1,f2
+└── bar v0.1.0 ([ROOT]/foo/bar) features=bar_feat
+",
+        )
+        .with_stderr("")
         .run();
 }

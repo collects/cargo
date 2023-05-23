@@ -28,8 +28,6 @@ pub fn cli() -> Command {
 }
 
 pub fn exec(config: &mut Config, args: &ArgMatches) -> CliResult {
-    config.load_credentials()?;
-
     let registry = args.registry(config)?;
     let ws = args.workspace(config)?;
     let index = args.index()?;
@@ -38,7 +36,9 @@ pub fn exec(config: &mut Config, args: &ArgMatches) -> CliResult {
         &ws,
         &PublishOpts {
             config,
-            token: args.get_one::<String>("token").map(|s| s.to_string()),
+            token: args
+                .get_one::<String>("token")
+                .map(|s| s.to_string().into()),
             index,
             verify: !args.flag("no-verify"),
             allow_dirty: args.flag("allow-dirty"),

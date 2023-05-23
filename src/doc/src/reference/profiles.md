@@ -67,14 +67,20 @@ amount of debug information included in the compiled binary.
 
 The valid options are:
 
-* `0` or `false`: no debug info at all
-* `1`: line tables only
-* `2` or `true`: full debug info
+* `0`, `false`, or `"none"`: no debug info at all, default for [`release`](#release)
+* `"line-directives-only"`: line info directives only. For the nvptx* targets this enables [profiling]. For other use cases, `line-tables-only` is the better, more compatible choice.
+* `"line-tables-only"`: line tables only. Generates the minimal amount of debug info for backtraces with filename/line number info, but not anything else, i.e. no variable or function parameter info.
+* `1` or `"limited"`: debug info without type or variable-level information. Generates more detailed module-level info than `line-tables-only`.
+* `2`, `true`, or `"full"`: full debug info, default for [`dev`](#dev)
+
+For more information on what each option does see `rustc`'s docs on [debuginfo].
 
 You may wish to also configure the [`split-debuginfo`](#split-debuginfo) option
 depending on your needs as well.
 
 [`-C debuginfo` flag]: ../../rustc/codegen-options/index.html#debuginfo
+[debuginfo]: ../../rustc/codegen-options/index.html#debuginfo
+[profiling]: https://reviews.llvm.org/D46061
 
 #### split-debuginfo
 
@@ -298,18 +304,27 @@ The `bench` profile inherits the settings from the [`release`](#release) profile
 
 #### Build Dependencies
 
-All profiles, by default, do not optimize build dependencies (build scripts,
-proc macros, and their dependencies). The default settings for build overrides
-are:
+To compile quickly, all profiles, by default, do not optimize build
+dependencies (build scripts, proc macros, and their dependencies), and avoid
+computing debug info when a build dependency is not used as a runtime
+dependency. The default settings for build overrides are:
 
 ```toml
 [profile.dev.build-override]
 opt-level = 0
 codegen-units = 256
+debug = false # when possible
 
 [profile.release.build-override]
 opt-level = 0
 codegen-units = 256
+```
+
+However, if errors occur while running build dependencies, turning full debug
+info on will improve backtraces and debuggability when needed:
+
+```toml
+debug = true
 ```
 
 Build dependencies otherwise inherit settings from the active profile in use, as
@@ -422,11 +437,11 @@ opt-level = 3
 The precedence for which value is used is done in the following order (first
 match wins):
 
-1. `[profile.dev.package.name]` — A named package.
-2. `[profile.dev.package."*"]` — For any non-workspace member.
-3. `[profile.dev.build-override]` — Only for build scripts, proc macros, and
+1. `[profile.dev.package.name]` --- A named package.
+2. `[profile.dev.package."*"]` --- For any non-workspace member.
+3. `[profile.dev.build-override]` --- Only for build scripts, proc macros, and
    their dependencies.
-4. `[profile.dev]` — Settings in `Cargo.toml`.
+4. `[profile.dev]` --- Settings in `Cargo.toml`.
 5. Default values built-in to Cargo.
 
 Overrides cannot specify the `panic`, `lto`, or `rpath` settings.

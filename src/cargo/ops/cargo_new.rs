@@ -2,16 +2,16 @@ use crate::core::{Edition, Shell, Workspace};
 use crate::util::errors::CargoResult;
 use crate::util::{existing_vcs_repo, FossilRepo, GitRepo, HgRepo, PijulRepo};
 use crate::util::{restricted_names, Config};
-use anyhow::Context as _;
+use anyhow::{anyhow, Context as _};
 use cargo_util::paths;
 use serde::de;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fmt;
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use toml_edit::easy as toml;
+use std::{fmt, slice};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VersionControl {
@@ -261,6 +261,19 @@ fn check_name(
     Ok(())
 }
 
+/// Checks if the path contains any invalid PATH env characters.
+fn check_path(path: &Path, shell: &mut Shell) -> CargoResult<()> {
+    // warn if the path contains characters that will break `env::join_paths`
+    if let Err(_) = paths::join_paths(slice::from_ref(&OsStr::new(path)), "") {
+        let path = path.to_string_lossy();
+        shell.warn(format!(
+            "the path `{path}` contains invalid PATH characters (usually `:`, `;`, or `\"`)\n\
+            It is recommended to use a different name to avoid problems."
+        ))?;
+    }
+    Ok(())
+}
+
 fn detect_source_paths_and_types(
     package_path: &Path,
     package_name: &str,
@@ -421,6 +434,8 @@ pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
         )
     }
 
+    check_path(path, &mut config.shell())?;
+
     let is_bin = opts.kind.is_bin();
 
     let name = get_name(path, opts)?;
@@ -448,7 +463,7 @@ pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
 
 pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<NewProjectKind> {
     // This is here just as a random location to exercise the internal error handling.
-    if std::env::var_os("__CARGO_TEST_INTERNAL_ERROR").is_some() {
+    if config.get_env_os("__CARGO_TEST_INTERNAL_ERROR").is_some() {
         return Err(crate::util::internal("internal error test"));
     }
 
@@ -457,6 +472,8 @@ pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<NewProjectKind> {
     if path.join("Cargo.toml").exists() {
         anyhow::bail!("`cargo init` cannot be run on existing Cargo packages")
     }
+
+    check_path(path, &mut config.shell())?;
 
     let name = get_name(path, opts)?;
 
@@ -497,31 +514,31 @@ pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<NewProjectKind> {
     let mut version_control = opts.version_control;
 
     if version_control == None {
-        let mut num_detected_vsces = 0;
+        let mut num_detected_vcses = 0;
 
         if path.join(".git").exists() {
             version_control = Some(VersionControl::Git);
-            num_detected_vsces += 1;
+            num_detected_vcses += 1;
         }
 
         if path.join(".hg").exists() {
             version_control = Some(VersionControl::Hg);
-            num_detected_vsces += 1;
+            num_detected_vcses += 1;
         }
 
         if path.join(".pijul").exists() {
             version_control = Some(VersionControl::Pijul);
-            num_detected_vsces += 1;
+            num_detected_vcses += 1;
         }
 
         if path.join(".fossil").exists() {
             version_control = Some(VersionControl::Fossil);
-            num_detected_vsces += 1;
+            num_detected_vcses += 1;
         }
 
         // if none exists, maybe create git, like in `cargo new`
 
-        if num_detected_vsces > 1 {
+        if num_detected_vcses > 1 {
             anyhow::bail!(
                 "more than one of .hg, .git, .pijul, .fossil configurations \
                  found and the ignore file can't be filled in as \
@@ -595,9 +612,22 @@ impl IgnoreList {
     /// already exists. It reads the contents of the given `BufRead` and
     /// checks if the contents of the ignore list are already existing in the
     /// file.
-    fn format_existing<T: BufRead>(&self, existing: T, vcs: VersionControl) -> String {
-        // TODO: is unwrap safe?
-        let existing_items = existing.lines().collect::<Result<Vec<_>, _>>().unwrap();
+    fn format_existing<T: BufRead>(&self, existing: T, vcs: VersionControl) -> CargoResult<String> {
+        let mut existing_items = Vec::new();
+        for (i, item) in existing.lines().enumerate() {
+            match item {
+                Ok(s) => existing_items.push(s),
+                Err(err) => match err.kind() {
+                    ErrorKind::InvalidData => {
+                        return Err(anyhow!(
+                            "Character at line {} is invalid. Cargo only supports UTF-8.",
+                            i
+                        ))
+                    }
+                    _ => return Err(anyhow!(err)),
+                },
+            }
+        }
 
         let ignore_items = match vcs {
             VersionControl::Hg => &self.hg_ignore,
@@ -631,7 +661,7 @@ impl IgnoreList {
             out.push('\n');
         }
 
-        out
+        Ok(out)
     }
 }
 
@@ -660,7 +690,7 @@ fn write_ignore_file(base_path: &Path, list: &IgnoreList, vcs: VersionControl) -
                 Some(io_err) if io_err.kind() == ErrorKind::NotFound => list.format_new(vcs),
                 _ => return Err(err),
             },
-            Ok(file) => list.format_existing(BufReader::new(file), vcs),
+            Ok(file) => list.format_existing(BufReader::new(file), vcs)?,
         };
 
         paths::append(&fp_ignore, ignore.as_bytes())?;
@@ -712,7 +742,7 @@ fn mk(config: &Config, opts: &MkOptions<'_>) -> CargoResult<()> {
     // Using the push method with multiple arguments ensures that the entries
     // for all mutually-incompatible VCS in terms of syntax are in sync.
     let mut ignore = IgnoreList::new();
-    ignore.push("/target", "^target/", "target");
+    ignore.push("/target", "^target$", "target");
     if !opts.bin {
         ignore.push("/Cargo.lock", "^Cargo.lock$", "Cargo.lock");
     }

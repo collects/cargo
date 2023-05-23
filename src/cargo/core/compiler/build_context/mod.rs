@@ -17,7 +17,7 @@ pub use self::target_info::{
     FileFlavor, FileType, RustDocFingerprint, RustcTargetData, TargetInfo,
 };
 
-/// The build context, containing complete infomration needed for a build task
+/// The build context, containing complete information needed for a build task
 /// before it gets started.
 ///
 /// It is intended that this is mostly static information. Stuff that mutates
@@ -39,6 +39,8 @@ pub use self::target_info::{
 /// To prepare a build task, you may not want to use [`BuildContext::new`] directly,
 /// since it is often too lower-level.
 /// Instead, [`ops::create_bcx`] is usually what you are looking for.
+///
+/// After a `BuildContext` is built, the next stage of building is handled in [`Context`].
 ///
 /// [`Context`]: crate::core::compiler::Context
 /// [`ops::create_bcx`]: crate::ops::create_bcx
@@ -145,7 +147,7 @@ impl<'a, 'cfg> BuildContext<'a, 'cfg> {
     /// Extra compiler flags to pass to `rustc` for a given unit.
     ///
     /// Although it depends on the caller, in the current Cargo implementation,
-    /// these flags take precendence over those from [`BuildContext::extra_args_for`].
+    /// these flags take precedence over those from [`BuildContext::extra_args_for`].
     ///
     /// As of now, these flags come from environment variables and configurations.
     /// See [`TargetInfo.rustflags`] for more on how Cargo collects them.
@@ -158,7 +160,7 @@ impl<'a, 'cfg> BuildContext<'a, 'cfg> {
     /// Extra compiler flags to pass to `rustdoc` for a given unit.
     ///
     /// Although it depends on the caller, in the current Cargo implementation,
-    /// these flags take precendence over those from [`BuildContext::extra_args_for`].
+    /// these flags take precedence over those from [`BuildContext::extra_args_for`].
     ///
     /// As of now, these flags come from environment variables and configurations.
     /// See [`TargetInfo.rustdocflags`] for more on how Cargo collects them.

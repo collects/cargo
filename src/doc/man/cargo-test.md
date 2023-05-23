@@ -5,7 +5,7 @@
 
 ## NAME
 
-cargo-test - Execute unit and integration tests of a package
+cargo-test --- Execute unit and integration tests of a package
 
 ## SYNOPSIS
 
@@ -57,6 +57,14 @@ and may change in the future; beware of depending on it.
 See the [rustdoc book](https://doc.rust-lang.org/rustdoc/) for more information
 on writing doc tests.
 
+### Working directory of tests
+
+The working directory of every test is set to the root directory of the package 
+the test belongs to.
+Setting the working directory of tests to the package's root directory makes it 
+possible for tests to reliably access the package's files using relative paths,
+regardless from where `cargo test` was executed from.
+
 ## OPTIONS
 
 ### Test Options
@@ -70,10 +78,10 @@ on writing doc tests.
 When no target selection options are given, `cargo test` will build the
 following targets of the selected packages:
 
-- lib — used to link with binaries, examples, integration tests, and doc tests
+- lib --- used to link with binaries, examples, integration tests, and doc tests
 - bins (only if integration tests are built and required features are
   available)
-- examples — to ensure they compile
+- examples --- to ensure they compile
 - lib as a unit test
 - bins as unit tests
 - integration tests
@@ -81,12 +89,19 @@ following targets of the selected packages:
 
 The default behavior can be changed by setting the `test` flag for the target
 in the manifest settings. Setting examples to `test = true` will build and run
-the example as a test. Setting targets to `test = false` will stop them from
-being tested by default. Target selection options that take a target by name
+the example as a test, replacing the example's `main` function with the
+libtest harness. If you don't want the `main` function replaced, also include
+`harness = false`, in which case the example will be built and executed as-is.
+
+Setting targets to `test = false` will stop them from being tested by default.
+Target selection options that take a target by name (such as `--example foo`)
 ignore the `test` flag and will always test the given target.
 
 Doc tests for libraries may be disabled by setting `doctest = false` for the
 library in the manifest.
+
+See [Configuring a target](../reference/cargo-targets.html#configuring-a-target)
+for more information on per-target settings.
 
 {{> options-targets-bin-auto-built }}
 

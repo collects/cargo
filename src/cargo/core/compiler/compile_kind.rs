@@ -1,7 +1,9 @@
+//! Type definitions for cross-compilation.
+
 use crate::core::Target;
 use crate::util::errors::CargoResult;
 use crate::util::interning::InternedString;
-use crate::util::{Config, StableHasher};
+use crate::util::{try_canonicalize, Config, StableHasher};
 use anyhow::Context as _;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -136,8 +138,7 @@ impl CompileTarget {
         // If `name` ends in `.json` then it's likely a custom target
         // specification. Canonicalize the path to ensure that different builds
         // with different paths always produce the same result.
-        let path = Path::new(name)
-            .canonicalize()
+        let path = try_canonicalize(Path::new(name))
             .with_context(|| format!("target path {:?} is not a valid file", name))?;
 
         let name = path

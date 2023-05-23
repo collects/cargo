@@ -98,7 +98,12 @@ pub fn add(workspace: &Workspace<'_>, options: &AddOptions<'_>) -> CargoResult<(
         .get_table(&dep_table)
         .map(TomlItem::as_table)
         .map_or(true, |table_option| {
-            table_option.map_or(true, |table| is_sorted(table.iter().map(|(name, _)| name)))
+            table_option.map_or(true, |table| {
+                is_sorted(table.get_values().iter_mut().map(|(key, _)| {
+                    // get_values key paths always have at least one key.
+                    key.remove(0)
+                }))
+            })
         });
     for dep in deps {
         print_action_msg(&mut options.config.shell(), &dep, &dep_table)?;
@@ -289,7 +294,7 @@ fn resolve_dependency(
         } else {
             let mut source = crate::sources::GitSource::new(src.source_id()?, config)?;
             let packages = source.read_packages()?;
-            let package = infer_package(packages, &src)?;
+            let package = infer_package_for_git_source(packages, &src)?;
             Dependency::from(package.summary())
         };
         selected
@@ -313,8 +318,10 @@ fn resolve_dependency(
             selected
         } else {
             let source = crate::sources::PathSource::new(&path, src.source_id()?, config);
-            let packages = source.read_packages()?;
-            let package = infer_package(packages, &src)?;
+            let package = source
+                .read_packages()?
+                .pop()
+                .expect("read_packages errors when no packages");
             Dependency::from(package.summary())
         };
         selected
@@ -599,11 +606,15 @@ fn select_package(
     }
 }
 
-fn infer_package(mut packages: Vec<Package>, src: &dyn std::fmt::Display) -> CargoResult<Package> {
+fn infer_package_for_git_source(
+    mut packages: Vec<Package>,
+    src: &dyn std::fmt::Display,
+) -> CargoResult<Package> {
     let package = match packages.len() {
-        0 => {
-            anyhow::bail!("no packages found at `{src}`");
-        }
+        0 => unreachable!(
+            "this function should only be called with packages from `GitSource::read_packages` \
+            and that call should error for us when there are no packages"
+        ),
         1 => packages.pop().expect("match ensured element is present"),
         _ => {
             let mut names: Vec<_> = packages
@@ -611,7 +622,19 @@ fn infer_package(mut packages: Vec<Package>, src: &dyn std::fmt::Display) -> Car
                 .map(|p| p.name().as_str().to_owned())
                 .collect();
             names.sort_unstable();
-            anyhow::bail!("multiple packages found at `{src}`: {}", names.join(", "));
+            anyhow::bail!(
+                "multiple packages found at `{src}`:\n    {}\nTo disambiguate, run `cargo add --git {src} <package>`",
+                names
+                    .iter()
+                    .map(|s| s.to_string())
+                    .coalesce(|x, y| if x.len() + y.len() < 78 {
+                        Ok(format!("{x}, {y}"))
+                    } else {
+                        Err((x, y))
+                    })
+                    .into_iter()
+                    .format("\n    "),
+            );
         }
     };
     Ok(package)
@@ -703,7 +726,8 @@ impl DependencyUI {
                     .get(next)
                     .into_iter()
                     .flatten()
-                    .map(|s| s.as_str()),
+                    .map(|s| s.as_str())
+                    .filter(|s| !activated.contains(s)),
             );
             activated.extend(
                 self.available_features

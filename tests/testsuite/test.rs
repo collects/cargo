@@ -2661,6 +2661,7 @@ fn bin_does_not_rebuild_tests() {
     p.cargo("test -v --no-run")
         .with_stderr(
             "\
+[DIRTY] foo v0.0.1 ([..]): the file `src/main.rs` has changed ([..])
 [COMPILING] foo v0.0.1 ([..])
 [RUNNING] `rustc [..] src/main.rs [..]`
 [RUNNING] `rustc [..] src/main.rs [..]`
@@ -3483,6 +3484,19 @@ fn cargo_test_env() {
     let cargo = cargo_exe().canonicalize().unwrap();
     p.cargo("test --lib -- --nocapture")
         .with_stderr_contains(cargo.to_str().unwrap())
+        .with_stdout_contains("test env_test ... ok")
+        .run();
+
+    // Check that `cargo test` propagates the environment's $CARGO
+    let rustc = cargo_util::paths::resolve_executable("rustc".as_ref())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let rustc = rustc.to_str().unwrap();
+    p.cargo("test --lib -- --nocapture")
+        // we use rustc since $CARGO is only used if it points to a path that exists
+        .env(cargo::CARGO_ENV, rustc)
+        .with_stderr_contains(rustc)
         .with_stdout_contains("test env_test ... ok")
         .run();
 }

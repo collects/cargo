@@ -2,9 +2,10 @@
 
 
 
+
 ## NAME
 
-cargo-add - Add dependencies to a Cargo.toml manifest file
+cargo-add --- Add dependencies to a Cargo.toml manifest file
 
 ## SYNOPSIS
 
@@ -85,10 +86,8 @@ which is defined by the <code>registry.default</code> config key which defaults 
 
 
 <dt class="option-term" id="option-cargo-add---target"><a class="option-anchor" href="#option-cargo-add---target"></a><code>--target</code> <em>target</em></dt>
-<dd class="option-desc">Add as a dependency to the <a href="../reference/specifying-dependencies.html#platform-specific-dependencies">given target platform</a>.</dd>
-
-
-</dl>
+<dd class="option-desc">Add as a dependency to the <a href="../reference/specifying-dependencies.html#platform-specific-dependencies">given target platform</a>.</p>
+<p>To avoid unexpected shell expansions, you may use quotes around each target, e.g., <code>--target 'cfg(unix)'</code>.</dd>
 
 
 </dl>
@@ -98,7 +97,7 @@ which is defined by the <code>registry.default</code> config key which defaults 
 <dl>
 
 <dt class="option-term" id="option-cargo-add---dry-run"><a class="option-anchor" href="#option-cargo-add---dry-run"></a><code>--dry-run</code></dt>
-<dd class="option-desc">Don't actually write the manifest</dd>
+<dd class="option-desc">Don’t actually write the manifest</dd>
 
 
 <dt class="option-term" id="option-cargo-add---rename"><a class="option-anchor" href="#option-cargo-add---rename"></a><code>--rename</code> <em>name</em></dt>
@@ -121,6 +120,7 @@ which is defined by the <code>registry.default</code> config key which defaults 
 <dd class="option-desc">Re-enable the <a href="../reference/features.html#dependency-features">default features</a>.</dd>
 
 
+<dt class="option-term" id="option-cargo-add--F"><a class="option-anchor" href="#option-cargo-add--F"></a><code>-F</code> <em>features</em></dt>
 <dt class="option-term" id="option-cargo-add---features"><a class="option-anchor" href="#option-cargo-add---features"></a><code>--features</code> <em>features</em></dt>
 <dd class="option-desc">Space or comma separated list of <a href="../reference/features.html#dependency-features">features to
 activate</a>. When adding multiple
@@ -137,7 +137,7 @@ which enables all specified features.</dd>
 <dl>
 <dt class="option-term" id="option-cargo-add--v"><a class="option-anchor" href="#option-cargo-add--v"></a><code>-v</code></dt>
 <dt class="option-term" id="option-cargo-add---verbose"><a class="option-anchor" href="#option-cargo-add---verbose"></a><code>--verbose</code></dt>
-<dd class="option-desc">Use verbose output. May be specified twice for &quot;very verbose&quot; output which
+<dd class="option-desc">Use verbose output. May be specified twice for “very verbose” output which
 includes extra output such as dependency warnings and build script output.
 May also be specified with the <code>term.verbose</code>
 <a href="../reference/config.html">config value</a>.</dd>
@@ -222,6 +222,17 @@ or provided as a path to an extra configuration file. This flag may be specified
 See the <a href="../reference/config.html#command-line-overrides">command-line overrides section</a> for more information.</dd>
 
 
+<dt class="option-term" id="option-cargo-add--C"><a class="option-anchor" href="#option-cargo-add--C"></a><code>-C</code> <em>PATH</em></dt>
+<dd class="option-desc">Changes the current working directory before executing any specified operations. This affects
+things like where cargo looks by default for the project manifest (<code>Cargo.toml</code>), as well as
+the directories searched for discovering <code>.cargo/config.toml</code>, for example. This option must
+appear before the command name, for example <code>cargo -C path/to/my-project build</code>.</p>
+<p>This option is only available on the <a href="https://doc.rust-lang.org/book/appendix-07-nightly-rust.html">nightly
+channel</a> and
+requires the <code>-Z unstable-options</code> flag to enable (see
+<a href="https://github.com/rust-lang/cargo/issues/10098">#10098</a>).</dd>
+
+
 <dt class="option-term" id="option-cargo-add--h"><a class="option-anchor" href="#option-cargo-add--h"></a><code>-h</code></dt>
 <dt class="option-term" id="option-cargo-add---help"><a class="option-anchor" href="#option-cargo-add---help"></a><code>--help</code></dt>
 <dd class="option-desc">Prints help information.</dd>
@@ -263,6 +274,10 @@ details on environment variables that Cargo reads.
 4. Add support for serializing data structures to json with `derive`s
 
        cargo add serde serde_json -F serde/derive
+
+5. Add `windows` as a platform specific dependency on `cfg(windows)`
+
+       cargo add windows --target 'cfg(windows)'
 
 ## SEE ALSO
 [cargo(1)](cargo.html), [cargo-remove(1)](cargo-remove.html)

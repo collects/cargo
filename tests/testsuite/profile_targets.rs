@@ -82,20 +82,25 @@ fn profile_selection_build() {
     // NOTES:
     // - bdep `panic` is not set because it thinks `build.rs` is a plugin.
     // - build_script_build is built without panic because it thinks `build.rs` is a plugin.
-    p.cargo("build -vv").with_stderr_unordered("\
+    // - We make sure that the build dependencies bar, bdep, and build.rs
+    //   are built with debuginfo=0.
+    p.cargo("build -vv")
+        .with_stderr_unordered("\
 [COMPILING] bar [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]
-[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=0[..]
 [COMPILING] bdep [..]
-[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=0[..]
 [COMPILING] foo [..]
-[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=0[..]
 [RUNNING] `[..]/target/debug/build/foo-[..]/build-script-build`
 [foo 0.0.1] foo custom build PROFILE=debug DEBUG=true OPT_LEVEL=0
 [RUNNING] `[..] rustc --crate-name foo src/lib.rs [..]--crate-type lib --emit=[..]link -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]
 [RUNNING] `[..] rustc --crate-name foo src/main.rs [..]--crate-type bin --emit=[..]link -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]
 [FINISHED] dev [unoptimized + debuginfo] [..]
-").run();
+"
+        )
+        .run();
     p.cargo("build -vv")
         .with_stderr_unordered(
             "\
@@ -149,6 +154,8 @@ fn profile_selection_build_all_targets() {
     //   `build.rs` is a plugin.
     // - Benchmark dependencies are compiled in `dev` mode, which may be
     //   surprising. See issue rust-lang/cargo#4929.
+    // - We make sure that the build dependencies bar, bdep, and build.rs
+    //   are built with debuginfo=0.
     //
     // - Dependency profiles:
     //   Pkg  Target  Profile     Reason
@@ -169,15 +176,16 @@ fn profile_selection_build_all_targets() {
     //   bin      dev        dev
     //   bin      dev        build
     //   example  dev        build
-    p.cargo("build --all-targets -vv").with_stderr_unordered("\
+    p.cargo("build --all-targets -vv")
+        .with_stderr_unordered("\
 [COMPILING] bar [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=1 -C debuginfo=2 [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]
-[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=0[..]
 [COMPILING] bdep [..]
-[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=0[..]
 [COMPILING] foo [..]
-[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=0[..]
 [RUNNING] `[..]/target/debug/build/foo-[..]/build-script-build`
 [foo 0.0.1] foo custom build PROFILE=debug DEBUG=true OPT_LEVEL=0
 [RUNNING] `[..] rustc --crate-name foo src/lib.rs [..]--crate-type lib --emit=[..]link -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]`
@@ -189,7 +197,9 @@ fn profile_selection_build_all_targets() {
 [RUNNING] `[..] rustc --crate-name foo src/main.rs [..]--crate-type bin --emit=[..]link -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]`
 [RUNNING] `[..] rustc --crate-name ex1 examples/ex1.rs [..]--crate-type bin --emit=[..]link -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]`
 [FINISHED] dev [unoptimized + debuginfo] [..]
-").run();
+"
+        )
+        .run();
     p.cargo("build -vv")
         .with_stderr_unordered(
             "\
@@ -295,12 +305,12 @@ fn profile_selection_test() {
     p.cargo("test -vv").with_stderr_unordered("\
 [COMPILING] bar [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=3 -C debuginfo=2 [..]
-[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link -C panic=abort[..]-C codegen-units=3 -C debuginfo=2 [..]
 [COMPILING] bdep [..]
-[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [COMPILING] foo [..]
-[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `[..]/target/debug/build/foo-[..]/build-script-build`
 [foo 0.0.1] foo custom build PROFILE=debug DEBUG=true OPT_LEVEL=0
 [RUNNING] `[..] rustc --crate-name foo src/lib.rs [..]--crate-type lib --emit=[..]link -C panic=abort[..]-C codegen-units=3 -C debuginfo=2 [..]
@@ -492,13 +502,13 @@ fn profile_selection_check_all_targets() {
     //
     p.cargo("check --all-targets -vv").with_stderr_unordered("\
 [COMPILING] bar [..]
-[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]metadata[..]-C codegen-units=1 -C debuginfo=2 [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]metadata -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]
 [COMPILING] bdep[..]
-[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [COMPILING] foo [..]
-[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `[..]target/debug/build/foo-[..]/build-script-build`
 [foo 0.0.1] foo custom build PROFILE=debug DEBUG=true OPT_LEVEL=0
 [RUNNING] `[..] rustc --crate-name foo src/lib.rs [..]--crate-type lib --emit=[..]metadata -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]
@@ -596,12 +606,12 @@ fn profile_selection_check_all_targets_test() {
     //
     p.cargo("check --all-targets --profile=test -vv").with_stderr_unordered("\
 [COMPILING] bar [..]
-[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]metadata[..]-C codegen-units=3 -C debuginfo=2 [..]
 [COMPILING] bdep[..]
-[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [COMPILING] foo [..]
-[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `[..]target/debug/build/foo-[..]/build-script-build`
 [foo 0.0.1] foo custom build PROFILE=debug DEBUG=true OPT_LEVEL=0
 [RUNNING] `[..] rustc --crate-name foo src/lib.rs [..]--crate-type lib --emit=[..]metadata[..]-C codegen-units=3 -C debuginfo=2 [..]
@@ -642,13 +652,13 @@ fn profile_selection_doc() {
     p.cargo("doc -vv").with_stderr_unordered("\
 [COMPILING] bar [..]
 [DOCUMENTING] bar [..]
-[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `rustdoc [..]--crate-name bar bar/src/lib.rs [..]
 [RUNNING] `[..] rustc --crate-name bar bar/src/lib.rs [..]--crate-type lib --emit=[..]metadata -C panic=abort[..]-C codegen-units=1 -C debuginfo=2 [..]
 [COMPILING] bdep [..]
-[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name bdep bdep/src/lib.rs [..]--crate-type lib --emit=[..]link[..]-C codegen-units=5 [..]
 [COMPILING] foo [..]
-[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 -C debuginfo=2 [..]
+[RUNNING] `[..] rustc --crate-name build_script_build build.rs [..]--crate-type bin --emit=[..]link[..]-C codegen-units=5 [..]
 [RUNNING] `[..]target/debug/build/foo-[..]/build-script-build`
 [foo 0.0.1] foo custom build PROFILE=debug DEBUG=true OPT_LEVEL=0
 [DOCUMENTING] foo [..]

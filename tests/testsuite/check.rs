@@ -6,8 +6,8 @@ use crate::messages::raw_rustc_output;
 use cargo_test_support::install::exe;
 use cargo_test_support::paths::CargoPathExt;
 use cargo_test_support::registry::Package;
-use cargo_test_support::tools;
 use cargo_test_support::{basic_bin_manifest, basic_manifest, git, project};
+use cargo_test_support::{tools, wrapped_clippy_driver};
 
 #[cargo_test]
 fn check_success() {
@@ -804,7 +804,7 @@ fn short_message_format() {
         .with_stderr_contains(
             "\
 src/lib.rs:1:27: error[E0308]: mismatched types
-error: could not compile `foo` due to previous error
+error: could not compile `foo` (lib) due to previous error
 ",
         )
         .run();
@@ -1193,36 +1193,8 @@ fn check_fixable_warning() {
         .build();
 
     foo.cargo("check")
-        .masquerade_as_nightly_cargo(&["auto-fix note"])
         .with_stderr_contains("[..] (run `cargo fix --lib -p foo` to apply 1 suggestion)")
         .run();
-}
-
-#[cargo_test]
-fn check_fixable_not_nightly() {
-    let foo = project()
-        .file(
-            "Cargo.toml",
-            r#"
-                [package]
-                name = "foo"
-                version = "0.0.1"
-            "#,
-        )
-        .file("src/lib.rs", "use std::io;")
-        .build();
-
-    let rustc_message = raw_rustc_output(&foo, "src/lib.rs", &[]);
-    let expected_output = format!(
-        "\
-[CHECKING] foo v0.0.1 ([..])
-{}\
-[WARNING] `foo` (lib) generated 1 warning
-[FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
-",
-        rustc_message
-    );
-    foo.cargo("check").with_stderr(expected_output).run();
 }
 
 #[cargo_test]
@@ -1250,7 +1222,6 @@ mod tests {
         .build();
 
     foo.cargo("check --all-targets")
-        .masquerade_as_nightly_cargo(&["auto-fix note"])
         .with_stderr_contains("[..] (run `cargo fix --lib -p foo --tests` to apply 1 suggestion)")
         .run();
     foo.cargo("fix --lib -p foo --tests --allow-no-vcs").run();
@@ -1280,12 +1251,11 @@ fn check_fixable_error_no_fix() {
 [CHECKING] foo v0.0.1 ([..])
 {}\
 [WARNING] `foo` (lib) generated 1 warning
-[ERROR] could not compile `foo` due to previous error; 1 warning emitted
+[ERROR] could not compile `foo` (lib) due to previous error; 1 warning emitted
 ",
         rustc_message
     );
     foo.cargo("check")
-        .masquerade_as_nightly_cargo(&["auto-fix note"])
         .with_status(101)
         .with_stderr(expected_output)
         .run();
@@ -1325,7 +1295,6 @@ fn check_fixable_warning_workspace() {
         .build();
 
     p.cargo("check")
-        .masquerade_as_nightly_cargo(&["auto-fix note"])
         .with_stderr_contains("[..] (run `cargo fix --lib -p foo` to apply 1 suggestion)")
         .with_stderr_contains("[..] (run `cargo fix --lib -p bar` to apply 1 suggestion)")
         .run();
@@ -1350,7 +1319,6 @@ fn check_fixable_example() {
         .file("examples/ex1.rs", "use std::fmt; fn main() {}")
         .build();
     p.cargo("check --all-targets")
-        .masquerade_as_nightly_cargo(&["auto-fix note"])
         .with_stderr_contains("[..] (run `cargo fix --example \"ex1\"` to apply 1 suggestion)")
         .run();
 }
@@ -1393,7 +1361,6 @@ fn check_fixable_bench() {
         )
         .build();
     p.cargo("check --all-targets")
-        .masquerade_as_nightly_cargo(&["auto-fix note"])
         .with_stderr_contains("[..] (run `cargo fix --bench \"bench\"` to apply 1 suggestion)")
         .run();
 }
@@ -1441,9 +1408,92 @@ fn check_fixable_mixed() {
         )
         .build();
     p.cargo("check --all-targets")
-        .masquerade_as_nightly_cargo(&["auto-fix note"])
         .with_stderr_contains("[..] (run `cargo fix --bin \"foo\" --tests` to apply 2 suggestions)")
         .with_stderr_contains("[..] (run `cargo fix --example \"ex1\"` to apply 1 suggestion)")
         .with_stderr_contains("[..] (run `cargo fix --bench \"bench\"` to apply 1 suggestion)")
+        .run();
+}
+
+#[cargo_test]
+fn check_fixable_warning_for_clippy() {
+    let foo = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+            "#,
+        )
+        // We don't want to show a warning that is `clippy`
+        // specific since we are using a `rustc` wrapper
+        // inplace of `clippy`
+        .file("src/lib.rs", "use std::io;")
+        .build();
+
+    foo.cargo("check")
+        // We can't use `clippy` so we use a `rustc` workspace wrapper instead
+        .env("RUSTC_WORKSPACE_WRAPPER", wrapped_clippy_driver())
+        .with_stderr_contains("[..] (run `cargo clippy --fix --lib -p foo` to apply 1 suggestion)")
+        .run();
+}
+
+#[cargo_test]
+fn check_unused_manifest_keys() {
+    Package::new("dep", "0.1.0").publish();
+    Package::new("foo", "0.1.0").publish();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "bar"
+            version = "0.2.0"
+            authors = []
+
+            [dependencies]
+            dep = { version = "0.1.0", wxz = "wxz" }
+            foo = { version = "0.1.0", abc = "abc" }
+
+            [dev-dependencies]
+            foo = { version = "0.1.0", wxz = "wxz" }
+
+            [build-dependencies]
+            foo = { version = "0.1.0", wxz = "wxz" }
+
+            [target.'cfg(windows)'.dependencies]
+            foo = { version = "0.1.0", wxz = "wxz" }
+
+            [target.x86_64-pc-windows-gnu.dev-dependencies]
+            foo = { version = "0.1.0", wxz = "wxz" }
+
+            [target.bar.build-dependencies]
+            foo = { version = "0.1.0", wxz = "wxz" }
+        "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("check")
+        .with_stderr(
+            "\
+[WARNING] unused manifest key: dependencies.dep.wxz
+[WARNING] unused manifest key: dependencies.foo.abc
+[WARNING] unused manifest key: dev-dependencies.foo.wxz
+[WARNING] unused manifest key: build-dependencies.foo.wxz
+[WARNING] unused manifest key: target.bar.build-dependencies.foo.wxz
+[WARNING] unused manifest key: target.cfg(windows).dependencies.foo.wxz
+[WARNING] unused manifest key: target.x86_64-pc-windows-gnu.dev-dependencies.foo.wxz
+[UPDATING] `[..]` index
+[DOWNLOADING] crates ...
+[DOWNLOADED] foo v0.1.0 ([..])
+[DOWNLOADED] dep v0.1.0 ([..])
+[CHECKING] [..]
+[CHECKING] [..]
+[CHECKING] bar v0.2.0 ([CWD])
+[FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
+",
+        )
         .run();
 }

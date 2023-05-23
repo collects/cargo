@@ -1,6 +1,10 @@
 //! Tests for --offline flag.
 
-use cargo_test_support::{basic_manifest, git, main_file, path2url, project, registry::Package};
+use cargo_test_support::{
+    basic_manifest, git, main_file, path2url, project,
+    registry::{Package, RegistryBuilder},
+    Execs,
+};
 use std::fs;
 
 #[cargo_test]
@@ -24,13 +28,13 @@ fn offline_unused_target_dep() {
         .file("src/lib.rs", "")
         .build();
     // Do a build that downloads only what is necessary.
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr_contains("[DOWNLOADED] used_dep [..]")
         .with_stderr_does_not_contain("[DOWNLOADED] unused_dep [..]")
         .run();
     p.cargo("clean").run();
     // Build offline, make sure it works.
-    p.cargo("build --offline").run();
+    p.cargo("check --offline").run();
 }
 
 #[cargo_test]
@@ -50,13 +54,13 @@ fn offline_missing_optional() {
         .file("src/lib.rs", "")
         .build();
     // Do a build that downloads only what is necessary.
-    p.cargo("build")
+    p.cargo("check")
         .with_stderr_does_not_contain("[DOWNLOADED] opt_dep [..]")
         .run();
     p.cargo("clean").run();
     // Build offline, make sure it works.
-    p.cargo("build --offline").run();
-    p.cargo("build --offline --features=opt_dep")
+    p.cargo("check --offline").run();
+    p.cargo("check --offline --features=opt_dep")
         .with_stderr(
             "\
 [ERROR] failed to download `opt_dep v1.0.0`
@@ -89,7 +93,7 @@ fn cargo_compile_path_with_offline() {
         .file("bar/src/lib.rs", "")
         .build();
 
-    p.cargo("build --offline").run();
+    p.cargo("check --offline").run();
 }
 
 #[cargo_test]
@@ -114,7 +118,7 @@ fn cargo_compile_with_downloaded_dependency_with_offline() {
         )
         .file("src/lib.rs", "")
         .build();
-    p.cargo("build").run();
+    p.cargo("check").run();
 
     let p2 = project()
         .at("bar")
@@ -132,11 +136,11 @@ fn cargo_compile_with_downloaded_dependency_with_offline() {
         .file("src/lib.rs", "")
         .build();
 
-    p2.cargo("build --offline")
+    p2.cargo("check --offline")
         .with_stderr(
             "\
-[COMPILING] present_dep v1.2.3
-[COMPILING] bar v0.1.0 ([..])
+[CHECKING] present_dep v1.2.3
+[CHECKING] bar v0.1.0 ([..])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]",
         )
         .run();
@@ -171,14 +175,14 @@ surprising resolution failures, if this error is too confusing you may wish to \
 retry without the offline flag.
 ";
 
-    p.cargo("build --offline")
+    p.cargo("check --offline")
         .with_status(101)
         .with_stderr(msg)
         .run();
 
     // While we're here, also check the config works.
     p.change_file(".cargo/config", "net.offline = true");
-    p.cargo("build").with_status(101).with_stderr(msg).run();
+    p.cargo("check").with_status(101).with_stderr(msg).run();
 }
 
 #[cargo_test]
@@ -269,7 +273,7 @@ fn cargo_compile_forbird_git_httpsrepo_offline() {
         .file("src/main.rs", "")
         .build();
 
-    p.cargo("build --offline").with_status(101).with_stderr("\
+    p.cargo("check --offline").with_status(101).with_stderr("\
 [ERROR] failed to get `dep1` as a dependency of package `foo v0.5.0 [..]`
 
 Caused by:
@@ -310,7 +314,7 @@ fn compile_offline_while_transitive_dep_not_cached() {
         .build();
 
     // simulate download bar, but fail to download baz
-    p.cargo("build")
+    p.cargo("check")
         .with_status(101)
         .with_stderr_contains("[..]failed to verify the checksum of `baz[..]")
         .run();
@@ -318,7 +322,7 @@ fn compile_offline_while_transitive_dep_not_cached() {
     // Restore the file contents.
     fs::write(&baz_path, &baz_content).unwrap();
 
-    p.cargo("build --offline")
+    p.cargo("check --offline")
         .with_status(101)
         .with_stderr(
             "\
@@ -331,7 +335,6 @@ Caused by:
         .run();
 }
 
-#[cargo_test]
 fn update_offline_not_cached() {
     let p = project()
         .file(
@@ -363,7 +366,27 @@ retry without the offline flag.",
 }
 
 #[cargo_test]
+fn update_offline_not_cached_sparse() {
+    let _registry = RegistryBuilder::new().http_index().build();
+    update_offline_not_cached()
+}
+
+#[cargo_test]
+fn update_offline_not_cached_git() {
+    update_offline_not_cached()
+}
+
+#[cargo_test]
 fn cargo_compile_offline_with_cached_git_dep() {
+    compile_offline_with_cached_git_dep(false)
+}
+
+#[cargo_test]
+fn gitoxide_cargo_compile_offline_with_cached_git_dep_shallow_dep() {
+    compile_offline_with_cached_git_dep(true)
+}
+
+fn compile_offline_with_cached_git_dep(shallow: bool) {
     let git_project = git::new("dep1", |project| {
         project
             .file("Cargo.toml", &basic_manifest("dep1", "0.5.0"))
@@ -407,7 +430,17 @@ fn cargo_compile_offline_with_cached_git_dep() {
         )
         .file("src/main.rs", "fn main(){}")
         .build();
-    prj.cargo("build").run();
+    let maybe_use_shallow = |mut cargo: Execs| -> Execs {
+        if shallow {
+            cargo
+                .arg("-Zgitoxide=fetch,shallow-deps")
+                .masquerade_as_nightly_cargo(&[
+                    "unstable features must be available for -Z gitoxide",
+                ]);
+        }
+        cargo
+    };
+    maybe_use_shallow(prj.cargo("build")).run();
 
     prj.change_file(
         "Cargo.toml",
@@ -425,7 +458,7 @@ fn cargo_compile_offline_with_cached_git_dep() {
             rev2
         ),
     );
-    prj.cargo("build").run();
+    maybe_use_shallow(prj.cargo("build")).run();
 
     let p = project()
         .file(
@@ -450,15 +483,15 @@ fn cargo_compile_offline_with_cached_git_dep() {
 
     let git_root = git_project.root();
 
-    p.cargo("build --offline")
-        .with_stderr(format!(
-            "\
+    let mut cargo = p.cargo("build --offline");
+    cargo.with_stderr(format!(
+        "\
 [COMPILING] dep1 v0.5.0 ({}#[..])
 [COMPILING] foo v0.5.0 ([CWD])
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]",
-            path2url(git_root),
-        ))
-        .run();
+        path2url(git_root),
+    ));
+    maybe_use_shallow(cargo).run();
 
     assert!(p.bin("foo").is_file());
 
@@ -483,7 +516,7 @@ fn cargo_compile_offline_with_cached_git_dep() {
         ),
     );
 
-    p.cargo("build --offline").run();
+    maybe_use_shallow(p.cargo("build --offline")).run();
     p.process(&p.bin("foo"))
         .with_stdout("hello from cached git repo rev1\n")
         .run();
@@ -530,7 +563,7 @@ fn offline_resolve_optional_fail() {
         "#,
     );
 
-    p.cargo("build --offline")
+    p.cargo("check --offline")
         .with_status(101)
         .with_stderr(
             "\
@@ -644,7 +677,7 @@ fn main(){
         .with_status(0)
         .with_stderr(
             "\
-[UPDATING] present_dep v1.2.9 -> v1.2.3
+[DOWNGRADING] present_dep v1.2.9 -> v1.2.3
 ",
         )
         .run();
@@ -691,7 +724,7 @@ retry without the offline flag.
 #[cargo_test]
 fn offline_and_frozen_and_no_lock() {
     let p = project().file("src/lib.rs", "").build();
-    p.cargo("build --frozen --offline")
+    p.cargo("check --frozen --offline")
         .with_status(101)
         .with_stderr("\
 error: the lock file [ROOT]/foo/Cargo.lock needs to be updated but --frozen was passed to prevent this
@@ -704,7 +737,7 @@ remove the --frozen flag and use --offline instead.
 #[cargo_test]
 fn offline_and_locked_and_no_frozen() {
     let p = project().file("src/lib.rs", "").build();
-    p.cargo("build --locked --offline")
+    p.cargo("check --locked --offline")
         .with_status(101)
         .with_stderr("\
 error: the lock file [ROOT]/foo/Cargo.lock needs to be updated but --locked was passed to prevent this

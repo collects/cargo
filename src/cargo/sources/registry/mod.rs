@@ -162,12 +162,12 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::task::Poll;
+use std::task::{ready, Poll};
 
 use anyhow::Context as _;
-use cargo_util::paths::exclude_from_backups_and_indexing;
+use cargo_util::paths::{self, exclude_from_backups_and_indexing};
 use flate2::read::GzDecoder;
 use log::debug;
 use semver::Version;
@@ -188,7 +188,7 @@ use crate::util::{
 
 const PACKAGE_SOURCE_LOCK: &str = ".cargo-ok";
 pub const CRATES_IO_INDEX: &str = "https://github.com/rust-lang/crates.io-index";
-pub const CRATES_IO_HTTP_INDEX: &str = "https://index.crates.io/";
+pub const CRATES_IO_HTTP_INDEX: &str = "sparse+https://index.crates.io/";
 pub const CRATES_IO_REGISTRY: &str = "crates-io";
 pub const CRATES_IO_DOMAIN: &str = "crates.io";
 const CRATE_TEMPLATE: &str = "{crate}";
@@ -197,6 +197,7 @@ const PREFIX_TEMPLATE: &str = "{prefix}";
 const LOWER_PREFIX_TEMPLATE: &str = "{lowerprefix}";
 const CHECKSUM_TEMPLATE: &str = "{sha256-checksum}";
 const MAX_UNPACK_SIZE: u64 = 512 * 1024 * 1024;
+const MAX_COMPRESSION_RATIO: usize = 20; // 20:1
 
 /// A "source" for a local (see `local::LocalRegistry`) or remote (see
 /// `remote::RemoteRegistry`) registry.
@@ -240,7 +241,7 @@ pub struct RegistryConfig {
     /// crate's sha256 checksum.
     ///
     /// For backwards compatibility, if the string does not contain any
-    /// markers (`{crate}`, `{version}`, `{prefix}`, or ``{lowerprefix}`), it
+    /// markers (`{crate}`, `{version}`, `{prefix}`, or `{lowerprefix}`), it
     /// will be extended with `/{crate}/{version}/download` to
     /// support registries like crates.io which were created before the
     /// templating setup was created.
@@ -250,6 +251,10 @@ pub struct RegistryConfig {
     /// operations like yanks, owner modifications, publish new crates, etc.
     /// If this is None, the registry does not support API commands.
     pub api: Option<String>,
+
+    /// Whether all operations require authentication.
+    #[serde(default)]
+    pub auth_required: bool,
 }
 
 /// The maximum version of the `v` field in the index this version of cargo
@@ -282,6 +287,13 @@ pub struct RegistryPackage<'a> {
     /// Added early 2018 (see <https://github.com/rust-lang/cargo/pull/4978>),
     /// can be `None` if published before then.
     links: Option<InternedString>,
+    /// Required version of rust
+    ///
+    /// Corresponds to `package.rust-version`.
+    ///
+    /// Added in 2023 (see <https://github.com/rust-lang/crates.io/pull/6267>),
+    /// can be `None` if published before then or if not set in the manifest.
+    rust_version: Option<InternedString>,
     /// The schema version for this entry.
     ///
     /// If this is None, it defaults to version 1. Entries with unknown
@@ -417,6 +429,7 @@ impl<'a> RegistryDependency<'a> {
     }
 }
 
+/// Result from loading data from a registry.
 pub enum LoadResponse {
     /// The cache is valid. The cached data should be used.
     CacheValid,
@@ -467,6 +480,9 @@ pub trait RegistryData {
 
     /// Invalidates locally cached data.
     fn invalidate_cache(&mut self);
+
+    /// If quiet, the source should not display any progress or status messages.
+    fn set_quiet(&mut self, quiet: bool);
 
     /// Is the local cached data up-to-date?
     fn is_updated(&self) -> bool;
@@ -527,7 +543,11 @@ pub enum MaybeLock {
     ///
     /// `descriptor` is just a text string to display to the user of what is
     /// being downloaded.
-    Download { url: String, descriptor: String },
+    Download {
+        url: String,
+        descriptor: String,
+        authorization: Option<String>,
+    },
 }
 
 mod download;
@@ -536,10 +556,14 @@ mod index;
 mod local;
 mod remote;
 
-fn short_name(id: SourceId) -> String {
+fn short_name(id: SourceId, is_shallow: bool) -> String {
     let hash = hex::short_hash(&id);
     let ident = id.url().host_str().unwrap_or("").to_string();
-    format!("{}-{}", ident, hash)
+    let mut name = format!("{}-{}", ident, hash);
+    if is_shallow {
+        name.push_str("-shallow");
+    }
+    name
 }
 
 impl<'cfg> RegistrySource<'cfg> {
@@ -548,7 +572,15 @@ impl<'cfg> RegistrySource<'cfg> {
         yanked_whitelist: &HashSet<PackageId>,
         config: &'cfg Config,
     ) -> CargoResult<RegistrySource<'cfg>> {
-        let name = short_name(source_id);
+        assert!(source_id.is_remote_registry());
+        let name = short_name(
+            source_id,
+            config
+                .cli_unstable()
+                .gitoxide
+                .map_or(false, |gix| gix.fetch && gix.shallow_index)
+                && !source_id.is_sparse(),
+        );
         let ops = if source_id.is_sparse() {
             Box::new(http_remote::HttpRegistry::new(source_id, config, &name)?) as Box<_>
         } else {
@@ -570,7 +602,7 @@ impl<'cfg> RegistrySource<'cfg> {
         yanked_whitelist: &HashSet<PackageId>,
         config: &'cfg Config,
     ) -> RegistrySource<'cfg> {
-        let name = short_name(source_id);
+        let name = short_name(source_id, false);
         let ops = local::LocalRegistry::new(path, config, &name);
         RegistrySource::new(source_id, config, &name, Box::new(ops), yanked_whitelist)
     }
@@ -608,18 +640,66 @@ impl<'cfg> RegistrySource<'cfg> {
         // unpacked.
         let package_dir = format!("{}-{}", pkg.name(), pkg.version());
         let dst = self.src_path.join(&package_dir);
-        dst.create_dir()?;
         let path = dst.join(PACKAGE_SOURCE_LOCK);
         let path = self.config.assert_package_cache_locked(&path);
         let unpack_dir = path.parent().unwrap();
-        if let Ok(meta) = path.metadata() {
-            if meta.len() > 0 {
-                return Ok(unpack_dir.to_path_buf());
+        match path.metadata() {
+            Ok(meta) if meta.len() > 0 => return Ok(unpack_dir.to_path_buf()),
+            Ok(_meta) => {
+                // The `.cargo-ok` file is not in a state we expect it to be
+                // (with two bytes containing "ok").
+                //
+                // Cargo has always included a `.cargo-ok` file to detect if
+                // extraction was interrupted, but it was originally empty.
+                //
+                // In 1.34, Cargo was changed to create the `.cargo-ok` file
+                // before it started extraction to implement fine-grained
+                // locking. After it was finished extracting, it wrote two
+                // bytes to indicate it was complete. It would use the length
+                // check to detect if it was possibly interrupted.
+                //
+                // In 1.36, Cargo changed to not use fine-grained locking, and
+                // instead used a global lock. The use of `.cargo-ok` was no
+                // longer needed for locking purposes, but was kept to detect
+                // when extraction was interrupted.
+                //
+                // In 1.49, Cargo changed to not create the `.cargo-ok` file
+                // before it started extraction to deal with `.crate` files
+                // that inexplicably had a `.cargo-ok` file in them.
+                //
+                // In 1.64, Cargo changed to detect `.crate` files with
+                // `.cargo-ok` files in them in response to CVE-2022-36113,
+                // which dealt with malicious `.crate` files making
+                // `.cargo-ok` a symlink causing cargo to write "ok" to any
+                // arbitrary file on the filesystem it has permission to.
+                //
+                // This is all a long-winded way of explaining the
+                // circumstances that might cause a directory to contain a
+                // `.cargo-ok` file that is empty or otherwise corrupted.
+                // Either this was extracted by a version of Rust before 1.34,
+                // in which case everything should be fine. However, an empty
+                // file created by versions 1.36 to 1.49 indicates that the
+                // extraction was interrupted and that we need to start again.
+                //
+                // Another possibility is that the filesystem is simply
+                // corrupted, in which case deleting the directory might be
+                // the safe thing to do. That is probably unlikely, though.
+                //
+                // To be safe, this deletes the directory and starts over
+                // again.
+                log::warn!("unexpected length of {path:?}, clearing cache");
+                paths::remove_dir_all(dst.as_path_unlocked())?;
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("failed to access package completion {path:?}: {e}"),
         }
-        let gz = GzDecoder::new(tarball);
-        let gz = LimitErrorReader::new(gz, max_unpack_size());
-        let mut tar = Archive::new(gz);
+        dst.create_dir()?;
+        let mut tar = {
+            let size_limit = max_unpack_size(self.config, tarball.metadata()?.len());
+            let gz = GzDecoder::new(tarball);
+            let gz = LimitErrorReader::new(gz, size_limit);
+            Archive::new(gz)
+        };
         let prefix = unpack_dir.file_name().unwrap();
         let parent = unpack_dir.parent().unwrap();
         for entry in tar.entries()? {
@@ -694,7 +774,7 @@ impl<'cfg> RegistrySource<'cfg> {
         let req = OptVersionReq::exact(package.version());
         let summary_with_cksum = self
             .index
-            .summaries(package.name(), &req, &mut *self.ops)?
+            .summaries(&package.name(), &req, &mut *self.ops)?
             .expect("a downloaded dep now pending!?")
             .map(|s| s.summary.clone())
             .next()
@@ -724,36 +804,79 @@ impl<'cfg> Source for RegistrySource<'cfg> {
         {
             debug!("attempting query without update");
             let mut called = false;
-            let pend =
-                self.index
-                    .query_inner(dep, &mut *self.ops, &self.yanked_whitelist, &mut |s| {
-                        if dep.matches(&s) {
-                            called = true;
-                            f(s);
-                        }
-                    })?;
-            if pend.is_pending() {
-                return Poll::Pending;
-            }
+            ready!(self.index.query_inner(
+                &dep.package_name(),
+                dep.version_req(),
+                &mut *self.ops,
+                &self.yanked_whitelist,
+                &mut |s| {
+                    if dep.matches(&s) {
+                        called = true;
+                        f(s);
+                    }
+                },
+            ))?;
             if called {
-                return Poll::Ready(Ok(()));
+                Poll::Ready(Ok(()))
             } else {
                 debug!("falling back to an update");
                 self.invalidate_cache();
-                return Poll::Pending;
+                Poll::Pending
+            }
+        } else {
+            let mut called = false;
+            ready!(self.index.query_inner(
+                &dep.package_name(),
+                dep.version_req(),
+                &mut *self.ops,
+                &self.yanked_whitelist,
+                &mut |s| {
+                    let matched = match kind {
+                        QueryKind::Exact => dep.matches(&s),
+                        QueryKind::Fuzzy => true,
+                    };
+                    if matched {
+                        f(s);
+                        called = true;
+                    }
+                }
+            ))?;
+            if called {
+                return Poll::Ready(Ok(()));
+            }
+            let mut any_pending = false;
+            if kind == QueryKind::Fuzzy {
+                // Attempt to handle misspellings by searching for a chain of related
+                // names to the original name. The resolver will later
+                // reject any candidates that have the wrong name, and with this it'll
+                // along the way produce helpful "did you mean?" suggestions.
+                // For now we only try the canonical lysing `-` to `_` and vice versa.
+                // More advanced fuzzy searching become in the future.
+                for name_permutation in [
+                    dep.package_name().replace('-', "_"),
+                    dep.package_name().replace('_', "-"),
+                ] {
+                    if name_permutation.as_str() == dep.package_name().as_str() {
+                        continue;
+                    }
+                    any_pending |= self
+                        .index
+                        .query_inner(
+                            &name_permutation,
+                            dep.version_req(),
+                            &mut *self.ops,
+                            &self.yanked_whitelist,
+                            f,
+                        )?
+                        .is_pending();
+                }
+            }
+            if any_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
             }
         }
-
-        self.index
-            .query_inner(dep, &mut *self.ops, &self.yanked_whitelist, &mut |s| {
-                let matched = match kind {
-                    QueryKind::Exact => dep.matches(&s),
-                    QueryKind::Fuzzy => true,
-                };
-                if matched {
-                    f(s);
-                }
-            })
     }
 
     fn supports_checksums(&self) -> bool {
@@ -773,6 +896,10 @@ impl<'cfg> Source for RegistrySource<'cfg> {
         self.ops.invalidate_cache();
     }
 
+    fn set_quiet(&mut self, quiet: bool) {
+        self.ops.set_quiet(quiet);
+    }
+
     fn download(&mut self, package: PackageId) -> CargoResult<MaybePackage> {
         let hash = loop {
             match self.index.hash(package, &mut *self.ops)? {
@@ -782,9 +909,15 @@ impl<'cfg> Source for RegistrySource<'cfg> {
         };
         match self.ops.download(package, hash)? {
             MaybeLock::Ready(file) => self.get_pkg(package, &file).map(MaybePackage::Ready),
-            MaybeLock::Download { url, descriptor } => {
-                Ok(MaybePackage::Download { url, descriptor })
-            }
+            MaybeLock::Download {
+                url,
+                descriptor,
+                authorization,
+            } => Ok(MaybePackage::Download {
+                url,
+                descriptor,
+                authorization,
+            }),
         }
     }
 
@@ -835,18 +968,49 @@ impl<'cfg> Source for RegistrySource<'cfg> {
     }
 }
 
-/// For integration test only.
-#[inline]
-fn max_unpack_size() -> u64 {
-    const VAR: &str = "__CARGO_TEST_MAX_UNPACK_SIZE";
-    if cfg!(debug_assertions) && std::env::var(VAR).is_ok() {
-        std::env::var(VAR)
+/// Get the maximum upack size that Cargo permits
+/// based on a given `size` of your compressed file.
+///
+/// Returns the larger one between `size * max compression ratio`
+/// and a fixed max unpacked size.
+///
+/// In reality, the compression ratio usually falls in the range of 2:1 to 10:1.
+/// We choose 20:1 to cover almost all possible cases hopefully.
+/// Any ratio higher than this is considered as a zip bomb.
+///
+/// In the future we might want to introduce a configurable size.
+///
+/// Some of the real world data from common compression algorithms:
+///
+/// * <https://www.zlib.net/zlib_tech.html>
+/// * <https://cran.r-project.org/web/packages/brotli/vignettes/brotli-2015-09-22.pdf>
+/// * <https://blog.cloudflare.com/results-experimenting-brotli/>
+/// * <https://tukaani.org/lzma/benchmarks.html>
+fn max_unpack_size(config: &Config, size: u64) -> u64 {
+    const SIZE_VAR: &str = "__CARGO_TEST_MAX_UNPACK_SIZE";
+    const RATIO_VAR: &str = "__CARGO_TEST_MAX_UNPACK_RATIO";
+    let max_unpack_size = if cfg!(debug_assertions) && config.get_env(SIZE_VAR).is_ok() {
+        // For integration test only.
+        config
+            .get_env(SIZE_VAR)
             .unwrap()
             .parse()
             .expect("a max unpack size in bytes")
     } else {
         MAX_UNPACK_SIZE
-    }
+    };
+    let max_compression_ratio = if cfg!(debug_assertions) && config.get_env(RATIO_VAR).is_ok() {
+        // For integration test only.
+        config
+            .get_env(RATIO_VAR)
+            .unwrap()
+            .parse()
+            .expect("a max compression ratio in bytes")
+    } else {
+        MAX_COMPRESSION_RATIO
+    };
+
+    u64::max(max_unpack_size, size * max_compression_ratio as u64)
 }
 
 fn make_dep_prefix(name: &str) -> String {

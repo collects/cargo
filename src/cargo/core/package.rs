@@ -16,7 +16,6 @@ use lazycell::LazyCell;
 use log::{debug, warn};
 use semver::Version;
 use serde::Serialize;
-use toml_edit::easy as toml;
 
 use crate::core::compiler::{CompileKind, RustcTargetData};
 use crate::core::dependency::DepKind;
@@ -27,9 +26,10 @@ use crate::core::{Dependency, Manifest, PackageId, SourceId, Target};
 use crate::core::{SourceMap, Summary, Workspace};
 use crate::ops;
 use crate::util::config::PackageCacheLock;
-use crate::util::errors::{CargoResult, HttpNotSuccessful};
+use crate::util::errors::{CargoResult, HttpNotSuccessful, DEBUG_HEADERS};
 use crate::util::interning::InternedString;
-use crate::util::network::Retry;
+use crate::util::network::retry::{Retry, RetryResult};
+use crate::util::network::sleep::SleepTracker;
 use crate::util::{self, internal, Config, Progress, ProgressStyle};
 
 pub const MANIFEST_PREAMBLE: &str = "\
@@ -48,14 +48,13 @@ pub const MANIFEST_PREAMBLE: &str = "\
 /// Information about a package that is available somewhere in the file system.
 ///
 /// A package is a `Cargo.toml` file plus all the files that are part of it.
-//
-// TODO: is `manifest_path` a relic?
 #[derive(Clone)]
 pub struct Package {
     inner: Rc<PackageInner>,
 }
 
 #[derive(Clone)]
+// TODO: is `manifest_path` a relic?
 struct PackageInner {
     /// The package's manifest.
     manifest: Manifest,
@@ -321,6 +320,8 @@ pub struct Downloads<'a, 'cfg> {
     /// Set of packages currently being downloaded. This should stay in sync
     /// with `pending`.
     pending_ids: HashSet<PackageId>,
+    /// Downloads that have failed and are waiting to retry again later.
+    sleeping: SleepTracker<(Download<'cfg>, Easy)>,
     /// The final result of each download. A pair `(token, result)`. This is a
     /// temporary holding area, needed because curl can report multiple
     /// downloads at once, but the main loop (`wait`) is written to only
@@ -377,6 +378,9 @@ struct Download<'cfg> {
 
     /// Actual downloaded data, updated throughout the lifetime of this download.
     data: RefCell<Vec<u8>>,
+
+    /// HTTP headers for debugging.
+    headers: RefCell<Vec<String>>,
 
     /// The URL that we're downloading from, cached here for error messages and
     /// reenqueuing.
@@ -444,6 +448,7 @@ impl<'cfg> PackageSet<'cfg> {
             next: 0,
             pending: HashMap::new(),
             pending_ids: HashSet::new(),
+            sleeping: SleepTracker::new(),
             results: Vec::new(),
             progress: RefCell::new(Some(Progress::with_style(
                 "Downloading",
@@ -653,23 +658,6 @@ impl<'cfg> PackageSet<'cfg> {
     }
 }
 
-// When dynamically linked against libcurl, we want to ignore some failures
-// when using old versions that don't support certain features.
-macro_rules! try_old_curl {
-    ($e:expr, $msg:expr) => {
-        let result = $e;
-        if cfg!(target_os = "macos") {
-            if let Err(e) = result {
-                warn!("ignoring libcurl {} error: {}", $msg, e);
-            }
-        } else {
-            result.with_context(|| {
-                anyhow::format_err!("failed to enable {}, is curl not built right?", $msg)
-            })?;
-        }
-    };
-}
-
 impl<'a, 'cfg> Downloads<'a, 'cfg> {
     /// Starts to download the package for the `id` specified.
     ///
@@ -703,13 +691,17 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         let pkg = source
             .download(id)
             .with_context(|| "unable to get packages from source")?;
-        let (url, descriptor) = match pkg {
+        let (url, descriptor, authorization) = match pkg {
             MaybePackage::Ready(pkg) => {
                 debug!("{} doesn't need a download", id);
                 assert!(slot.fill(pkg).is_ok());
                 return Ok(Some(slot.borrow().unwrap()));
             }
-            MaybePackage::Download { url, descriptor } => (url, descriptor),
+            MaybePackage::Download {
+                url,
+                descriptor,
+                authorization,
+            } => (url, descriptor, authorization),
         };
 
         // Ok we're going to download this crate, so let's set up all our
@@ -726,6 +718,13 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         handle.url(&url)?;
         handle.follow_location(true)?; // follow redirects
 
+        // Add authorization header.
+        if let Some(authorization) = authorization {
+            let mut headers = curl::easy::List::new();
+            headers.append(&format!("Authorization: {}", authorization))?;
+            handle.http_headers(headers)?;
+        }
+
         // Enable HTTP/2 to be used as it'll allow true multiplexing which makes
         // downloads much faster.
         //
@@ -739,7 +738,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         // errors here on OSX, but consider this a fatal error to not activate
         // HTTP/2 on all other platforms.
         if self.set.multiplexing {
-            try_old_curl!(handle.http_version(HttpVersion::V2), "HTTP2");
+            crate::try_old_curl!(handle.http_version(HttpVersion::V2), "HTTP2");
         } else {
             handle.http_version(HttpVersion::V11)?;
         }
@@ -751,7 +750,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         // Once the main one is opened we realized that pipelining is possible
         // and multiplexing is possible with static.crates.io. All in all this
         // reduces the number of connections down to a more manageable state.
-        try_old_curl!(handle.pipewait(true), "pipewait");
+        crate::try_old_curl!(handle.pipewait(true), "pipewait");
 
         handle.write_function(move |buf| {
             debug!("{} - {} bytes of data", token, buf.len());
@@ -765,6 +764,19 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
                 }
             });
             Ok(buf.len())
+        })?;
+        handle.header_function(move |data| {
+            tls::with(|downloads| {
+                if let Some(downloads) = downloads {
+                    // Headers contain trailing \r\n, trim them to make it easier
+                    // to work with.
+                    let h = String::from_utf8_lossy(data).trim().to_string();
+                    if DEBUG_HEADERS.iter().any(|p| h.starts_with(p)) {
+                        downloads.pending[&token].0.headers.borrow_mut().push(h);
+                    }
+                }
+            });
+            true
         })?;
 
         handle.progress(true)?;
@@ -791,6 +803,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         let dl = Download {
             token,
             data: RefCell::new(Vec::new()),
+            headers: RefCell::new(Vec::new()),
             id,
             url,
             descriptor,
@@ -808,7 +821,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
 
     /// Returns the number of crates that are still downloading.
     pub fn remaining(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.sleeping.len()
     }
 
     /// Blocks the current thread waiting for a package to finish downloading.
@@ -830,6 +843,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
                 .remove(&token)
                 .expect("got a token for a non-in-progress transfer");
             let data = mem::take(&mut *dl.data.borrow_mut());
+            let headers = mem::take(&mut *dl.headers.borrow_mut());
             let mut handle = self.set.multi.remove(handle)?;
             self.pending_ids.remove(&dl.id);
 
@@ -839,51 +853,52 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
             let ret = {
                 let timed_out = &dl.timed_out;
                 let url = &dl.url;
-                dl.retry
-                    .r#try(|| {
-                        if let Err(e) = result {
-                            // If this error is "aborted by callback" then that's
-                            // probably because our progress callback aborted due to
-                            // a timeout. We'll find out by looking at the
-                            // `timed_out` field, looking for a descriptive message.
-                            // If one is found we switch the error code (to ensure
-                            // it's flagged as spurious) and then attach our extra
-                            // information to the error.
-                            if !e.is_aborted_by_callback() {
-                                return Err(e.into());
-                            }
-
-                            return Err(match timed_out.replace(None) {
-                                Some(msg) => {
-                                    let code = curl_sys::CURLE_OPERATION_TIMEDOUT;
-                                    let mut err = curl::Error::new(code);
-                                    err.set_extra(msg);
-                                    err
-                                }
-                                None => e,
-                            }
-                            .into());
+                dl.retry.r#try(|| {
+                    if let Err(e) = result {
+                        // If this error is "aborted by callback" then that's
+                        // probably because our progress callback aborted due to
+                        // a timeout. We'll find out by looking at the
+                        // `timed_out` field, looking for a descriptive message.
+                        // If one is found we switch the error code (to ensure
+                        // it's flagged as spurious) and then attach our extra
+                        // information to the error.
+                        if !e.is_aborted_by_callback() {
+                            return Err(e.into());
                         }
 
-                        let code = handle.response_code()?;
-                        if code != 200 && code != 0 {
-                            let url = handle.effective_url()?.unwrap_or(url);
-                            return Err(HttpNotSuccessful {
-                                code,
-                                url: url.to_string(),
-                                body: data,
+                        return Err(match timed_out.replace(None) {
+                            Some(msg) => {
+                                let code = curl_sys::CURLE_OPERATION_TIMEDOUT;
+                                let mut err = curl::Error::new(code);
+                                err.set_extra(msg);
+                                err
                             }
-                            .into());
+                            None => e,
                         }
-                        Ok(data)
-                    })
-                    .with_context(|| format!("failed to download from `{}`", dl.url))?
+                        .into());
+                    }
+
+                    let code = handle.response_code()?;
+                    if code != 200 && code != 0 {
+                        return Err(HttpNotSuccessful::new_from_handle(
+                            &mut handle,
+                            &url,
+                            data,
+                            headers,
+                        )
+                        .into());
+                    }
+                    Ok(data)
+                })
             };
             match ret {
-                Some(data) => break (dl, data),
-                None => {
-                    self.pending_ids.insert(dl.id);
-                    self.enqueue(dl, handle)?
+                RetryResult::Success(data) => break (dl, data),
+                RetryResult::Err(e) => {
+                    return Err(e.context(format!("failed to download from `{}`", dl.url)))
+                }
+                RetryResult::Retry(sleep) => {
+                    debug!("download retry {} for {sleep}ms", dl.url);
+                    self.sleeping.push(sleep, (dl, handle));
                 }
             }
         };
@@ -971,6 +986,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         // actually block waiting for I/O to happen, which we achieve with the
         // `wait` method on `multi`.
         loop {
+            self.add_sleepers()?;
             let n = tls::set(self, || {
                 self.set
                     .multi
@@ -993,15 +1009,29 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
             if let Some(pair) = results.pop() {
                 break Ok(pair);
             }
-            assert!(!self.pending.is_empty());
-            let min_timeout = Duration::new(1, 0);
-            let timeout = self.set.multi.get_timeout()?.unwrap_or(min_timeout);
-            let timeout = timeout.min(min_timeout);
-            self.set
-                .multi
-                .wait(&mut [], timeout)
-                .with_context(|| "failed to wait on curl `Multi`")?;
+            assert_ne!(self.remaining(), 0);
+            if self.pending.is_empty() {
+                let delay = self.sleeping.time_to_next().unwrap();
+                debug!("sleeping main thread for {delay:?}");
+                std::thread::sleep(delay);
+            } else {
+                let min_timeout = Duration::new(1, 0);
+                let timeout = self.set.multi.get_timeout()?.unwrap_or(min_timeout);
+                let timeout = timeout.min(min_timeout);
+                self.set
+                    .multi
+                    .wait(&mut [], timeout)
+                    .with_context(|| "failed to wait on curl `Multi`")?;
+            }
         }
+    }
+
+    fn add_sleepers(&mut self) -> CargoResult<()> {
+        for (dl, handle) in self.sleeping.to_retry() {
+            self.pending_ids.insert(dl.id);
+            self.enqueue(dl, handle)?;
+        }
+        Ok(())
     }
 
     fn progress(&self, token: usize, total: u64, cur: u64) -> bool {
@@ -1069,7 +1099,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
                 return Ok(());
             }
         }
-        let pending = self.pending.len();
+        let pending = self.remaining();
         let mut msg = if pending == 1 {
             format!("{} crate", pending)
         } else {

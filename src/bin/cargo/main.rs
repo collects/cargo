@@ -1,5 +1,6 @@
 #![warn(rust_2018_idioms)] // while we're getting used to 2018
 #![allow(clippy::all)]
+#![warn(clippy::disallowed_methods)]
 
 use cargo::util::toml::StringOrVec;
 use cargo::util::CliError;
@@ -189,9 +190,22 @@ fn execute_external_subcommand(config: &Config, cmd: &str, args: &[&OsStr]) -> C
             return Err(CliError::new(err, 101));
         }
     };
+    execute_subcommand(config, Some(&command), args)
+}
 
+fn execute_internal_subcommand(config: &Config, args: &[&OsStr]) -> CliResult {
+    execute_subcommand(config, None, args)
+}
+
+// This function is used to execute a subcommand. It is used to execute both
+// internal and external subcommands.
+// If `cmd_path` is `None`, then the subcommand is an internal subcommand.
+fn execute_subcommand(config: &Config, cmd_path: Option<&PathBuf>, args: &[&OsStr]) -> CliResult {
     let cargo_exe = config.cargo_exe()?;
-    let mut cmd = ProcessBuilder::new(&command);
+    let mut cmd = match cmd_path {
+        Some(cmd_path) => ProcessBuilder::new(cmd_path),
+        None => ProcessBuilder::new(&cargo_exe),
+    };
     cmd.env(cargo::CARGO_ENV, cargo_exe).args(args);
     if let Some(client) = config.jobserver_from_env() {
         cmd.inherit_jobserver(client);
@@ -222,7 +236,7 @@ fn is_executable<P: AsRef<Path>>(path: P) -> bool {
 }
 
 fn search_directories(config: &Config) -> Vec<PathBuf> {
-    let mut path_dirs = if let Some(val) = env::var_os("PATH") {
+    let mut path_dirs = if let Some(val) = config.get_env_os("PATH") {
         env::split_paths(&val).collect()
     } else {
         vec![]
@@ -246,6 +260,38 @@ fn search_directories(config: &Config) -> Vec<PathBuf> {
     path_dirs
 }
 
+/// Initialize libgit2.
+fn init_git(config: &Config) {
+    // Disabling the owner validation in git can, in theory, lead to code execution
+    // vulnerabilities. However, libgit2 does not launch executables, which is the foundation of
+    // the original security issue. Meanwhile, issues with refusing to load git repos in
+    // `CARGO_HOME` for example will likely be very frustrating for users. So, we disable the
+    // validation.
+    //
+    // For further discussion of Cargo's current interactions with git, see
+    //
+    //   https://github.com/rust-lang/rfcs/pull/3279
+    //
+    // and in particular the subsection on "Git support".
+    //
+    // Note that we only disable this when Cargo is run as a binary. If Cargo is used as a library,
+    // this code won't be invoked. Instead, developers will need to explicitly disable the
+    // validation in their code. This is inconvenient, but won't accidentally open consuming
+    // applications up to security issues if they use git2 to open repositories elsewhere in their
+    // code.
+    unsafe {
+        git2::opts::set_verify_owner_validation(false)
+            .expect("set_verify_owner_validation should never fail");
+    }
+
+    init_git_transports(config);
+}
+
+/// Configure libgit2 to use libcurl if necessary.
+///
+/// If the user has a non-default network configuration, then libgit2 will be
+/// configured to use libcurl instead of the built-in networking support so
+/// that those configuration settings can be used.
 fn init_git_transports(config: &Config) {
     // Only use a custom transport if any HTTP options are specified,
     // such as proxies or custom certificate authorities. The custom
@@ -273,28 +319,5 @@ fn init_git_transports(config: &Config) {
     // anyway
     unsafe {
         git2_curl::register(handle);
-    }
-
-    // Disabling the owner validation in git can, in theory, lead to code execution
-    // vulnerabilities. However, libgit2 does not launch executables, which is the foundation of
-    // the original security issue. Meanwhile, issues with refusing to load git repos in
-    // `CARGO_HOME` for example will likely be very frustrating for users. So, we disable the
-    // validation.
-    //
-    // For further discussion of Cargo's current interactions with git, see
-    //
-    //   https://github.com/rust-lang/rfcs/pull/3279
-    //
-    // and in particular the subsection on "Git support".
-    //
-    // Note that we only disable this when Cargo is run as a binary. If Cargo is used as a library,
-    // this code won't be invoked. Instead, developers will need to explicitly disable the
-    // validation in their code. This is inconvenient, but won't accidentally open consuming
-    // applications up to security issues if they use git2 to open repositories elsewhere in their
-    // code.
-    unsafe {
-        if git2::opts::set_verify_owner_validation(false).is_err() {
-            return;
-        }
     }
 }

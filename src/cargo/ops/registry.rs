@@ -1,3 +1,4 @@
+use std::cmp;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead};
@@ -6,16 +7,17 @@ use std::path::PathBuf;
 use std::str;
 use std::task::Poll;
 use std::time::Duration;
-use std::{cmp, env};
 
-use anyhow::{bail, format_err, Context as _};
+use anyhow::{anyhow, bail, format_err, Context as _};
 use cargo_util::paths;
 use crates_io::{self, NewCrate, NewCrateDependency, Registry};
 use curl::easy::{Easy, InfoType, SslOpt, SslVersion};
 use log::{log, Level};
-use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
+use pasetors::keys::{AsymmetricKeyPair, Generate};
+use pasetors::paserk::FormatAsPaserk;
 use termcolor::Color::Green;
 use termcolor::ColorSpec;
+use url::Url;
 
 use crate::core::dependency::DepKind;
 use crate::core::dependency::Dependency;
@@ -27,27 +29,31 @@ use crate::core::{Package, SourceId, Workspace};
 use crate::ops;
 use crate::ops::Packages;
 use crate::sources::{RegistrySource, SourceConfigMap, CRATES_IO_DOMAIN, CRATES_IO_REGISTRY};
-use crate::util::config::{self, Config, SslVersionConfig, SslVersionConfigRange};
+use crate::util::auth::{
+    paserk_public_from_paserk_secret, Secret, {self, AuthorizationError},
+};
+use crate::util::config::{Config, SslVersionConfig, SslVersionConfigRange};
 use crate::util::errors::CargoResult;
 use crate::util::important_paths::find_root_manifest_for_wd;
 use crate::util::{truncate_with_ellipsis, IntoUrl};
+use crate::util::{Progress, ProgressStyle};
 use crate::{drop_print, drop_println, version};
-
-mod auth;
 
 /// Registry settings loaded from config files.
 ///
 /// This is loaded based on the `--registry` flag and the config settings.
-#[derive(Debug)]
-pub enum RegistryConfig {
+#[derive(Debug, PartialEq)]
+pub enum RegistryCredentialConfig {
     None,
     /// The authentication token.
-    Token(String),
+    Token(Secret<String>),
     /// Process used for fetching a token.
     Process((PathBuf, Vec<String>)),
+    /// Secret Key and subject for Asymmetric tokens.
+    AsymmetricKey((Secret<String>, Option<String>)),
 }
 
-impl RegistryConfig {
+impl RegistryCredentialConfig {
     /// Returns `true` if the credential is [`None`].
     ///
     /// [`None`]: Self::None
@@ -60,9 +66,15 @@ impl RegistryConfig {
     pub fn is_token(&self) -> bool {
         matches!(self, Self::Token(..))
     }
-    pub fn as_token(&self) -> Option<&str> {
+    /// Returns `true` if the credential is [`AsymmetricKey`].
+    ///
+    /// [`AsymmetricKey`]: RegistryCredentialConfig::AsymmetricKey
+    pub fn is_asymmetric_key(&self) -> bool {
+        matches!(self, Self::AsymmetricKey(..))
+    }
+    pub fn as_token(&self) -> Option<Secret<&str>> {
         if let Self::Token(v) = self {
-            Some(&*v)
+            Some(v.as_deref())
         } else {
             None
         }
@@ -74,11 +86,18 @@ impl RegistryConfig {
             None
         }
     }
+    pub fn as_asymmetric_key(&self) -> Option<&(Secret<String>, Option<String>)> {
+        if let Self::AsymmetricKey(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct PublishOpts<'cfg> {
     pub config: &'cfg Config,
-    pub token: Option<String>,
+    pub token: Option<Secret<String>>,
     pub index: Option<String>,
     pub verify: bool,
     pub allow_dirty: bool,
@@ -149,14 +168,18 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
             );
         }
     }
+    // This is only used to confirm that we can create a token before we build the package.
+    // This causes the credential provider to be called an extra time, but keeps the same order of errors.
+    let ver = pkg.version().to_string();
+    let mutation = auth::Mutation::PrePublish;
 
-    let (mut registry, _reg_cfg, reg_ids) = registry(
+    let (mut registry, reg_ids) = registry(
         opts.config,
-        opts.token.clone(),
+        opts.token.as_ref().map(Secret::as_deref),
         opts.index.as_deref(),
         publish_registry.as_deref(),
         true,
-        !opts.dry_run,
+        Some(mutation).filter(|_| !opts.dry_run),
     )?;
     verify_dependencies(pkg, &registry, reg_ids.original)?;
 
@@ -179,6 +202,23 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
         },
     )?
     .unwrap();
+
+    if !opts.dry_run {
+        let hash = cargo_util::Sha256::new()
+            .update_file(tarball.file())?
+            .finish_hex();
+        let mutation = Some(auth::Mutation::Publish {
+            name: pkg.name().as_str(),
+            vers: &ver,
+            cksum: &hash,
+        });
+        registry.set_token(Some(auth::auth_token(
+            &opts.config,
+            &reg_ids.original,
+            None,
+            mutation,
+        )?));
+    }
 
     opts.config
         .shell()
@@ -305,6 +345,7 @@ fn transmit(
         ref categories,
         ref badges,
         ref links,
+        ref rust_version,
     } = *manifest.metadata();
     let readme_content = readme
         .as_ref()
@@ -358,6 +399,7 @@ fn transmit(
                 license_file: license_file.clone(),
                 badges: badges.clone(),
                 links: links.clone(),
+                rust_version: rust_version.clone(),
             },
             tarball,
         )
@@ -403,13 +445,29 @@ fn wait_for_publish(
 ) -> CargoResult<()> {
     let version_req = format!("={}", pkg.version());
     let mut source = SourceConfigMap::empty(config)?.load(registry_src, &HashSet::new())?;
-    let source_description = source.describe();
+    // Disable the source's built-in progress bars. Repeatedly showing a bunch
+    // of independent progress bars can be a little confusing. There is an
+    // overall progress bar managed here.
+    source.set_quiet(true);
+    let source_description = source.source_id().to_string();
     let query = Dependency::parse(pkg.name(), Some(&version_req), registry_src)?;
 
     let now = std::time::Instant::now();
     let sleep_time = std::time::Duration::from_secs(1);
-    let mut logged = false;
-    loop {
+    let max = timeout.as_secs() as usize;
+    // Short does not include the registry name.
+    let short_pkg_description = format!("{} v{}", pkg.name(), pkg.version());
+    config.shell().status(
+        "Uploaded",
+        format!("{short_pkg_description} to {source_description}"),
+    )?;
+    config.shell().note(format!(
+        "Waiting for `{short_pkg_description}` to be available at {source_description}.\n\
+        You may press ctrl-c to skip waiting; the crate should be available shortly."
+    ))?;
+    let mut progress = Progress::with_style("Waiting", ProgressStyle::Ratio, config);
+    progress.tick_now(0, max, "")?;
+    let is_available = loop {
         {
             let _lock = config.acquire_package_cache_lock()?;
             // Force re-fetching the source
@@ -431,125 +489,65 @@ fn wait_for_publish(
                 }
             };
             if !summaries.is_empty() {
-                break;
+                break true;
             }
         }
 
-        if timeout < now.elapsed() {
+        let elapsed = now.elapsed();
+        if timeout < elapsed {
             config.shell().warn(format!(
-                "timed out waiting for `{}` to be in {}",
-                pkg.name(),
-                source_description
+                "timed out waiting for `{short_pkg_description}` to be available in {source_description}",
             ))?;
-            break;
+            config.shell().note(
+                "The registry may have a backlog that is delaying making the \
+                crate available. The crate should be available soon.",
+            )?;
+            break false;
         }
 
-        if !logged {
-            config.shell().status(
-                "Waiting",
-                format!(
-                    "on `{}` to propagate to {} (ctrl-c to wait asynchronously)",
-                    pkg.name(),
-                    source_description
-                ),
-            )?;
-            logged = true;
-        }
+        progress.tick_now(elapsed.as_secs() as usize, max, "")?;
         std::thread::sleep(sleep_time);
+    };
+    if is_available {
+        config.shell().status(
+            "Published",
+            format!("{short_pkg_description} at {source_description}"),
+        )?;
     }
 
     Ok(())
 }
 
-/// Returns the index and token from the config file for the given registry.
-///
-/// `registry` is typically the registry specified on the command-line. If
-/// `None`, `index` is set to `None` to indicate it should use crates.io.
-pub fn registry_configuration(
-    config: &Config,
-    registry: Option<&str>,
-) -> CargoResult<RegistryConfig> {
-    let err_both = |token_key: &str, proc_key: &str| {
-        Err(format_err!(
-            "both `{token_key}` and `{proc_key}` \
-             were specified in the config\n\
-             Only one of these values may be set, remove one or the other to proceed.",
-        ))
-    };
-    // `registry.default` is handled in command-line parsing.
-    let (token, process) = match registry {
-        Some("crates-io") | None => {
-            // Use crates.io default.
-            config.check_registry_index_not_set()?;
-            let token = config.get_string("registry.token")?.map(|p| p.val);
-            let process = if config.cli_unstable().credential_process {
-                let process =
-                    config.get::<Option<config::PathAndArgs>>("registry.credential-process")?;
-                if token.is_some() && process.is_some() {
-                    return err_both("registry.token", "registry.credential-process");
-                }
-                process
-            } else {
-                None
-            };
-            (token, process)
-        }
-        Some(registry) => {
-            let token_key = format!("registries.{registry}.token");
-            let token = config.get_string(&token_key)?.map(|p| p.val);
-            let process = if config.cli_unstable().credential_process {
-                let mut proc_key = format!("registries.{registry}.credential-process");
-                let mut process = config.get::<Option<config::PathAndArgs>>(&proc_key)?;
-                if process.is_none() && token.is_none() {
-                    // This explicitly ignores the global credential-process if
-                    // the token is set, as that is "more specific".
-                    proc_key = String::from("registry.credential-process");
-                    process = config.get::<Option<config::PathAndArgs>>(&proc_key)?;
-                } else if process.is_some() && token.is_some() {
-                    return err_both(&token_key, &proc_key);
-                }
-                process
-            } else {
-                None
-            };
-            (token, process)
-        }
-    };
-
-    let credential_process =
-        process.map(|process| (process.path.resolve_program(config), process.args));
-
-    Ok(match (token, credential_process) {
-        (None, None) => RegistryConfig::None,
-        (None, Some(process)) => RegistryConfig::Process(process),
-        (Some(x), None) => RegistryConfig::Token(x),
-        (Some(_), Some(_)) => unreachable!("Only one of these values may be set."),
-    })
-}
-
 /// Returns the `Registry` and `Source` based on command-line and config settings.
 ///
-/// * `token`: The token from the command-line. If not set, uses the token
+/// * `token_from_cmdline`: The token from the command-line. If not set, uses the token
 ///   from the config.
 /// * `index`: The index URL from the command-line.
 /// * `registry`: The registry name from the command-line. If neither
 ///   `registry`, or `index` are set, then uses `crates-io`.
 /// * `force_update`: If `true`, forces the index to be updated.
-/// * `validate_token`: If `true`, the token must be set.
+/// * `token_required`: If `true`, the token will be set.
 fn registry(
     config: &Config,
-    token: Option<String>,
+    token_from_cmdline: Option<Secret<&str>>,
     index: Option<&str>,
     registry: Option<&str>,
     force_update: bool,
-    validate_token: bool,
-) -> CargoResult<(Registry, RegistryConfig, RegistrySourceIds)> {
+    token_required: Option<auth::Mutation<'_>>,
+) -> CargoResult<(Registry, RegistrySourceIds)> {
     let source_ids = get_source_id(config, index, registry)?;
-    let reg_cfg = registry_configuration(config, registry)?;
-    let api_host = {
+
+    if token_required.is_some() && index.is_some() && token_from_cmdline.is_none() {
+        bail!("command-line argument --index requires --token to be specified");
+    }
+    if let Some(token) = token_from_cmdline {
+        auth::cache_token(config, &source_ids.original, token);
+    }
+
+    let cfg = {
         let _lock = config.acquire_package_cache_lock()?;
         let mut src = RegistrySource::remote(source_ids.replacement, &HashSet::new(), config)?;
-        // Only update the index if the config is not available or `force` is set.
+        // Only update the index if `force_update` is set.
         if force_update {
             src.invalidate_cache()
         }
@@ -561,28 +559,24 @@ fn registry(
                 Poll::Ready(cfg) => break cfg,
             }
         };
-
-        cfg.and_then(|cfg| cfg.api).ok_or_else(|| {
-            format_err!("{} does not support API commands", source_ids.replacement)
-        })?
+        cfg.expect("remote registries must have config")
     };
-    let token = if validate_token {
-        if index.is_some() {
-            if token.is_none() {
-                bail!("command-line argument --index requires --token to be specified");
-            }
-            token
-        } else {
-            let token = auth::auth_token(config, token.as_deref(), &reg_cfg, registry, &api_host)?;
-            Some(token)
-        }
+    let api_host = cfg
+        .api
+        .ok_or_else(|| format_err!("{} does not support API commands", source_ids.replacement))?;
+    let token = if token_required.is_some() || cfg.auth_required {
+        Some(auth::auth_token(
+            config,
+            &source_ids.original,
+            None,
+            token_required,
+        )?)
     } else {
         None
     };
     let handle = http_handle(config)?;
     Ok((
-        Registry::new_handle(api_host, token, handle),
-        reg_cfg,
+        Registry::new_handle(api_host, token, handle, cfg.auth_required),
         source_ids,
     ))
 }
@@ -620,7 +614,7 @@ pub fn http_handle_and_timeout(config: &Config) -> CargoResult<(Easy, HttpTimeou
 pub fn needs_custom_http_transport(config: &Config) -> CargoResult<bool> {
     Ok(http_proxy_exists(config)?
         || *config.http_config()? != Default::default()
-        || env::var_os("HTTP_TIMEOUT").is_some())
+        || config.get_env_os("HTTP_TIMEOUT").is_some())
 }
 
 /// Configure a libcurl http handle with the defaults options for Cargo
@@ -643,9 +637,6 @@ pub fn configure_http_handle(config: &Config, handle: &mut Easy) -> CargoResult<
         handle.useragent(&format!("cargo {}", version()))?;
     }
 
-    // Empty string accept encoding expands to the encodings supported by the current libcurl.
-    handle.accept_encoding("")?;
-
     fn to_ssl_version(s: &str) -> CargoResult<SslVersion> {
         let version = match s {
             "default" => SslVersion::Default,
@@ -655,13 +646,15 @@ pub fn configure_http_handle(config: &Config, handle: &mut Easy) -> CargoResult<
             "tlsv1.2" => SslVersion::Tlsv12,
             "tlsv1.3" => SslVersion::Tlsv13,
             _ => bail!(
-                "Invalid ssl version `{}`,\
-                 choose from 'default', 'tlsv1', 'tlsv1.0', 'tlsv1.1', 'tlsv1.2', 'tlsv1.3'.",
-                s
+                "Invalid ssl version `{s}`,\
+                 choose from 'default', 'tlsv1', 'tlsv1.0', 'tlsv1.1', 'tlsv1.2', 'tlsv1.3'."
             ),
         };
         Ok(version)
     }
+
+    // Empty string accept encoding expands to the encodings supported by the current libcurl.
+    handle.accept_encoding("")?;
     if let Some(ssl_version) = &http.ssl_version {
         match ssl_version {
             SslVersionConfig::Single(s) => {
@@ -711,12 +704,17 @@ pub fn configure_http_handle(config: &Config, handle: &mut Easy) -> CargoResult<
                 InfoType::SslDataIn | InfoType::SslDataOut => return,
                 _ => return,
             };
+            let starts_with_ignore_case = |line: &str, text: &str| -> bool {
+                line[..line.len().min(text.len())].eq_ignore_ascii_case(text)
+            };
             match str::from_utf8(data) {
                 Ok(s) => {
                     for mut line in s.lines() {
-                        if line.starts_with("Authorization:") {
+                        if starts_with_ignore_case(line, "authorization:") {
                             line = "Authorization: [REDACTED]";
-                        } else if line[..line.len().min(10)].eq_ignore_ascii_case("set-cookie") {
+                        } else if starts_with_ignore_case(line, "h2h3 [authorization:") {
+                            line = "h2h3 [Authorization: [REDACTED]]";
+                        } else if starts_with_ignore_case(line, "set-cookie") {
                             line = "set-cookie: [REDACTED]";
                         }
                         log!(level, "http-debug: {} {}", prefix, line);
@@ -745,11 +743,16 @@ pub struct HttpTimeout {
 
 impl HttpTimeout {
     pub fn new(config: &Config) -> CargoResult<HttpTimeout> {
-        let config = config.http_config()?;
-        let low_speed_limit = config.low_speed_limit.unwrap_or(10);
-        let seconds = config
+        let http_config = config.http_config()?;
+        let low_speed_limit = http_config.low_speed_limit.unwrap_or(10);
+        let seconds = http_config
             .timeout
-            .or_else(|| env::var("HTTP_TIMEOUT").ok().and_then(|s| s.parse().ok()))
+            .or_else(|| {
+                config
+                    .get_env("HTTP_TIMEOUT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
             .unwrap_or(30);
         Ok(HttpTimeout {
             dur: Duration::new(seconds, 0),
@@ -803,70 +806,146 @@ fn http_proxy_exists(config: &Config) -> CargoResult<bool> {
     } else {
         Ok(["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"]
             .iter()
-            .any(|v| env::var(v).is_ok()))
+            .any(|v| config.get_env(v).is_ok()))
     }
 }
 
 pub fn registry_login(
     config: &Config,
-    token: Option<String>,
-    reg: Option<String>,
+    token: Option<Secret<&str>>,
+    reg: Option<&str>,
+    generate_keypair: bool,
+    secret_key_required: bool,
+    key_subject: Option<&str>,
 ) -> CargoResult<()> {
-    let (registry, reg_cfg, _) =
-        registry(config, token.clone(), None, reg.as_deref(), false, false)?;
+    let source_ids = get_source_id(config, None, reg)?;
+    let reg_cfg = auth::registry_credential_config(config, &source_ids.original)?;
 
-    let token = match token {
-        Some(token) => token,
-        None => {
-            drop_println!(
-                config,
-                "please paste the API Token found on {}/me below",
-                registry.host()
-            );
-            let mut line = String::new();
-            let input = io::stdin();
-            input
-                .lock()
-                .read_line(&mut line)
-                .with_context(|| "failed to read stdin")?;
-            // Automatically remove `cargo login` from an inputted token to
-            // allow direct pastes from `registry.host()`/me.
-            line.replace("cargo login", "").trim().to_string()
-        }
+    let login_url = match registry(config, token.clone(), None, reg, false, None) {
+        Ok((registry, _)) => Some(format!("{}/me", registry.host())),
+        Err(e) if e.is::<AuthorizationError>() => e
+            .downcast::<AuthorizationError>()
+            .unwrap()
+            .login_url
+            .map(|u| u.to_string()),
+        Err(e) => return Err(e),
     };
+    let new_token;
+    if generate_keypair || secret_key_required || key_subject.is_some() {
+        if !config.cli_unstable().registry_auth {
+            let flag = if generate_keypair {
+                "generate-keypair"
+            } else if secret_key_required {
+                "secret-key"
+            } else if key_subject.is_some() {
+                "key-subject"
+            } else {
+                unreachable!("how did we get here");
+            };
+            bail!(
+                "the `{flag}` flag is unstable, pass `-Z registry-auth` to enable it\n\
+                 See https://github.com/rust-lang/cargo/issues/10519 for more \
+                 information about the `{flag}` flag."
+            );
+        }
+        assert!(token.is_none());
+        // we are dealing with asymmetric tokens
+        let (old_secret_key, old_key_subject) = match &reg_cfg {
+            RegistryCredentialConfig::AsymmetricKey((old_secret_key, old_key_subject)) => {
+                (Some(old_secret_key), old_key_subject.clone())
+            }
+            _ => (None, None),
+        };
+        let secret_key: Secret<String>;
+        if generate_keypair {
+            assert!(!secret_key_required);
+            let kp = AsymmetricKeyPair::<pasetors::version3::V3>::generate().unwrap();
+            secret_key = Secret::default().map(|mut key| {
+                FormatAsPaserk::fmt(&kp.secret, &mut key).unwrap();
+                key
+            });
+        } else if secret_key_required {
+            assert!(!generate_keypair);
+            drop_println!(config, "please paste the API secret key below");
+            secret_key = Secret::default()
+                .map(|mut line| {
+                    let input = io::stdin();
+                    input
+                        .lock()
+                        .read_line(&mut line)
+                        .with_context(|| "failed to read stdin")
+                        .map(|_| line.trim().to_string())
+                })
+                .transpose()?;
+        } else {
+            secret_key = old_secret_key
+                .cloned()
+                .ok_or_else(|| anyhow!("need a secret_key to set a key_subject"))?;
+        }
+        if let Some(p) = paserk_public_from_paserk_secret(secret_key.as_deref()) {
+            drop_println!(config, "{}", &p);
+        } else {
+            bail!("not a validly formatted PASERK secret key");
+        }
+        new_token = RegistryCredentialConfig::AsymmetricKey((
+            secret_key,
+            match key_subject {
+                Some(key_subject) => Some(key_subject.to_string()),
+                None => old_key_subject,
+            },
+        ));
+    } else {
+        new_token = RegistryCredentialConfig::Token(match token {
+            Some(token) => token.owned(),
+            None => {
+                if let Some(login_url) = login_url {
+                    drop_println!(
+                        config,
+                        "please paste the token found on {} below",
+                        login_url
+                    )
+                } else {
+                    drop_println!(
+                        config,
+                        "please paste the token for {} below",
+                        source_ids.original.display_registry_name()
+                    )
+                }
 
-    if token.is_empty() {
-        bail!("please provide a non-empty token");
-    }
+                let mut line = String::new();
+                let input = io::stdin();
+                input
+                    .lock()
+                    .read_line(&mut line)
+                    .with_context(|| "failed to read stdin")?;
+                // Automatically remove `cargo login` from an inputted token to
+                // allow direct pastes from `registry.host()`/me.
+                Secret::from(line.replace("cargo login", "").trim().to_string())
+            }
+        });
 
-    if let RegistryConfig::Token(old_token) = &reg_cfg {
-        if old_token == &token {
-            config.shell().status("Login", "already logged in")?;
-            return Ok(());
+        if let Some(tok) = new_token.as_token() {
+            crates_io::check_token(tok.as_ref().expose())?;
         }
     }
+    if &reg_cfg == &new_token {
+        config.shell().status("Login", "already logged in")?;
+        return Ok(());
+    }
 
-    auth::login(
-        config,
-        token,
-        reg_cfg.as_process(),
-        reg.as_deref(),
-        registry.host(),
-    )?;
+    auth::login(config, &source_ids.original, new_token)?;
 
     config.shell().status(
         "Login",
-        format!(
-            "token for `{}` saved",
-            reg.as_ref().map_or(CRATES_IO_DOMAIN, String::as_str)
-        ),
+        format!("token for `{}` saved", reg.unwrap_or(CRATES_IO_DOMAIN)),
     )?;
     Ok(())
 }
 
-pub fn registry_logout(config: &Config, reg: Option<String>) -> CargoResult<()> {
-    let (registry, reg_cfg, _) = registry(config, None, None, reg.as_deref(), false, false)?;
-    let reg_name = reg.as_deref().unwrap_or(CRATES_IO_DOMAIN);
+pub fn registry_logout(config: &Config, reg: Option<&str>) -> CargoResult<()> {
+    let source_ids = get_source_id(config, None, reg)?;
+    let reg_cfg = auth::registry_credential_config(config, &source_ids.original)?;
+    let reg_name = source_ids.original.display_registry_name();
     if reg_cfg.is_none() {
         config.shell().status(
             "Logout",
@@ -874,12 +953,7 @@ pub fn registry_logout(config: &Config, reg: Option<String>) -> CargoResult<()> 
         )?;
         return Ok(());
     }
-    auth::logout(
-        config,
-        reg_cfg.as_process(),
-        reg.as_deref(),
-        registry.host(),
-    )?;
+    auth::logout(config, &source_ids.original)?;
     config.shell().status(
         "Logout",
         format!(
@@ -887,12 +961,26 @@ pub fn registry_logout(config: &Config, reg: Option<String>) -> CargoResult<()> 
             reg_name
         ),
     )?;
+    let location = if source_ids.original.is_crates_io() {
+        "<https://crates.io/me>".to_string()
+    } else {
+        // The URL for the source requires network access to load the config.
+        // That could be a fairly heavy operation to perform just to provide a
+        // help message, so for now this just provides some generic text.
+        // Perhaps in the future this could have an API to fetch the config if
+        // it is cached, but avoid network access otherwise?
+        format!("the `{reg_name}` website")
+    };
+    config.shell().note(format!(
+        "This does not revoke the token on the registry server.\n    \
+        If you need to revoke the token, visit {location} and follow the instructions there."
+    ))?;
     Ok(())
 }
 
 pub struct OwnersOptions {
     pub krate: Option<String>,
-    pub token: Option<String>,
+    pub token: Option<Secret<String>>,
     pub index: Option<String>,
     pub to_add: Option<Vec<String>>,
     pub to_remove: Option<Vec<String>>,
@@ -910,13 +998,15 @@ pub fn modify_owners(config: &Config, opts: &OwnersOptions) -> CargoResult<()> {
         }
     };
 
-    let (mut registry, _, _) = registry(
+    let mutation = auth::Mutation::Owners { name: &name };
+
+    let (mut registry, _) = registry(
         config,
-        opts.token.clone(),
+        opts.token.as_ref().map(Secret::as_deref),
         opts.index.as_deref(),
         opts.registry.as_deref(),
         true,
-        true,
+        Some(mutation),
     )?;
 
     if let Some(ref v) = opts.to_add {
@@ -971,7 +1061,7 @@ pub fn yank(
     config: &Config,
     krate: Option<String>,
     version: Option<String>,
-    token: Option<String>,
+    token: Option<Secret<String>>,
     index: Option<String>,
     undo: bool,
     reg: Option<String>,
@@ -989,8 +1079,26 @@ pub fn yank(
         None => bail!("a version must be specified to yank"),
     };
 
-    let (mut registry, _, _) =
-        registry(config, token, index.as_deref(), reg.as_deref(), true, true)?;
+    let message = if undo {
+        auth::Mutation::Unyank {
+            name: &name,
+            vers: &version,
+        }
+    } else {
+        auth::Mutation::Yank {
+            name: &name,
+            vers: &version,
+        }
+    };
+
+    let (mut registry, _) = registry(
+        config,
+        token.as_ref().map(Secret::as_deref),
+        index.as_deref(),
+        reg.as_deref(),
+        true,
+        Some(message),
+    )?;
 
     let package_spec = format!("{}@{}", name, version);
     if undo {
@@ -1031,11 +1139,8 @@ fn get_source_id(
 ) -> CargoResult<RegistrySourceIds> {
     let sid = match (reg, index) {
         (None, None) => SourceId::crates_io(config)?,
+        (_, Some(i)) => SourceId::for_registry(&i.into_url()?)?,
         (Some(r), None) => SourceId::alt_registry(config, r)?,
-        (None, Some(i)) => SourceId::for_registry(&i.into_url()?)?,
-        (Some(_), Some(_)) => {
-            bail!("both `--index` and `--registry` should not be set at the same time")
-        }
     };
     // Load source replacements that are built-in to Cargo.
     let builtin_replacement_sid = SourceConfigMap::empty(config)?
@@ -1079,8 +1184,8 @@ pub fn search(
     limit: u32,
     reg: Option<String>,
 ) -> CargoResult<()> {
-    let (mut registry, _, source_ids) =
-        registry(config, None, index.as_deref(), reg.as_deref(), false, false)?;
+    let (mut registry, source_ids) =
+        registry(config, None, index.as_deref(), reg.as_deref(), false, None)?;
     let (crates, total_crates) = registry.search(query, limit).with_context(|| {
         format!(
             "failed to retrieve search results from the registry at {}",
@@ -1137,10 +1242,8 @@ pub fn search(
         );
     } else if total_crates > limit && limit >= search_max_limit {
         let extra = if source_ids.original.is_crates_io() {
-            format!(
-                " (go to https://crates.io/search?q={} to see more)",
-                percent_encode(query.as_bytes(), NON_ALPHANUMERIC)
-            )
+            let url = Url::parse_with_params("https://crates.io/search", &[("q", query)])?;
+            format!(" (go to {url} to see more)")
         } else {
             String::new()
         };
